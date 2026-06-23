@@ -1,0 +1,442 @@
+import React, { useCallback } from 'react';
+import { useAppStore } from '../stores/appStore';
+import { TaxiwayControlState, TaxiwayId, ALL_TAXIWAY_IDS } from '../types';
+import { systemApi, runwayApi, taxiwayApi } from '../services/api';
+import { Volume2, VolumeX } from 'lucide-react';
+import { AirportSimPanel } from '../components/AirportSimPanel';
+
+// ── Colour helpers ─────────────────────────────────────────────────────────────
+
+function twColor(state: TaxiwayControlState, rwyOff: boolean): string {
+  if (state === 'OFF') return rwyOff ? '#00AA66' : '#333333';
+  switch (state) {
+    case 'GUARDED':          return '#FFD700';
+    case 'AUTHORIZED':       return '#00FF88';
+    case 'INCURSION_LATCHED': return '#FF3333';
+    case 'FAULT':            return '#FFAA00';
+    default:                 return '#333333';
+  }
+}
+
+function twGlow(state: TaxiwayControlState, rwyOff: boolean): string {
+  if (state === 'OFF') return rwyOff ? '0 0 8px 2px rgba(0,170,102,0.4)' : 'none';
+  switch (state) {
+    case 'GUARDED':          return '0 0 10px 3px rgba(255,215,0,0.6)';
+    case 'AUTHORIZED':       return '0 0 10px 3px rgba(0,255,136,0.6)';
+    case 'INCURSION_LATCHED': return '0 0 18px 6px rgba(255,51,51,1)';
+    case 'FAULT':            return '0 0 10px 3px rgba(255,170,0,0.6)';
+    default:                 return 'none';
+  }
+}
+
+function twBg(state: TaxiwayControlState, rwyOff: boolean): string {
+  if (state === 'OFF') return rwyOff ? 'rgba(0,170,102,0.06)' : 'rgba(20,20,20,0.8)';
+  switch (state) {
+    case 'GUARDED':          return 'rgba(255,215,0,0.12)';
+    case 'AUTHORIZED':       return 'rgba(0,255,136,0.12)';
+    case 'INCURSION_LATCHED': return 'rgba(255,51,51,0.2)';
+    case 'FAULT':            return 'rgba(255,170,0,0.12)';
+    default:                 return 'rgba(20,20,20,0.8)';
+  }
+}
+
+// ── Taxiway button ─────────────────────────────────────────────────────────────
+
+interface TaxiwayButtonProps {
+  id: TaxiwayId;
+  state: TaxiwayControlState;
+  onClick: (id: TaxiwayId) => void;
+  rwyOff: boolean;
+}
+
+function TaxiwayButton({ id, state, onClick, rwyOff }: TaxiwayButtonProps) {
+  const color = twColor(state, rwyOff);
+  return (
+    <button
+      onClick={() => onClick(id)}
+      style={{
+        backgroundColor: twBg(state, rwyOff),
+        border: `2px solid ${color}`,
+        boxShadow: `${twGlow(state, rwyOff)}, inset 0 2px 4px rgba(0,0,0,0.5)`,
+        color,
+        animation:
+          state === 'INCURSION_LATCHED' ? 'pulseRed 1s ease-in-out infinite'
+          : state === 'FAULT' ? 'flashYellow 0.5s ease-in-out infinite'
+          : 'none',
+      }}
+      className="h-10 rounded font-mono text-sm font-bold tracking-widest transition-all hover:brightness-125 active:scale-95 relative overflow-hidden"
+      title={`聯絡道 ${id}: ${state}`}
+    >
+      <span className="relative z-10">{id}</span>
+      <div
+        className="absolute inset-0 opacity-15"
+        style={{ background: `radial-gradient(circle at 50% 30%, ${color}, transparent 70%)` }}
+      />
+    </button>
+  );
+}
+
+// ── Compact runway SVG ─────────────────────────────────────────────────────────
+
+function CompactRunway({
+  taxiways,
+  hasIncursion,
+  rwyOff,
+}: {
+  taxiways: { id: TaxiwayId; state: TaxiwayControlState }[];
+  hasIncursion: boolean;
+  rwyOff: boolean;
+}) {
+  const northIds: TaxiwayId[] = ['1N', '2N', '3N', '4N', '5N', '6N'];
+  const southIds: TaxiwayId[] = ['1S', '2S', '3S', '4S', '5S', '6S'];
+  const txX = (i: number) => 24 + i * 60;
+
+  const getColor = (id: TaxiwayId) => {
+    const t = taxiways.find(t => t.id === id);
+    return twColor(t?.state ?? 'OFF', rwyOff);
+  };
+  const isLatched = (id: TaxiwayId) => taxiways.find(t => t.id === id)?.state === 'INCURSION_LATCHED';
+
+  return (
+    <svg
+      viewBox="0 0 384 52"
+      style={{ width: '100%', height: 52, display: 'block', filter: hasIncursion ? 'drop-shadow(0 0 6px rgba(255,51,51,0.5))' : 'none' }}
+    >
+      {/* Runway rect */}
+      <rect x="4" y="18" width="376" height="16" fill="#1c1c1c" stroke="#3a3a3a" strokeWidth="1.5" rx="2"/>
+      {/* Centerline */}
+      <line x1="14" y1="26" x2="370" y2="26" stroke="#2e2e2e" strokeWidth="1" strokeDasharray="12,8"/>
+      {/* RWY numbers */}
+      <text x="10" y="30" fill="#3a3a3a" fontSize="9" fontFamily="monospace" fontWeight="bold">18</text>
+      <text x="374" y="30" fill="#3a3a3a" fontSize="9" fontFamily="monospace" fontWeight="bold" textAnchor="end">36</text>
+
+      {/* North stubs */}
+      {northIds.map((id, i) => {
+        const x = txX(i);
+        const col = getColor(id);
+        const latched = isLatched(id);
+        return (
+          <g key={id}>
+            <line x1={x} y1="0" x2={x} y2="16" stroke={col} strokeWidth="3" opacity={col === '#333333' ? 0.3 : 0.9}/>
+            <circle cx={x} cy="14" r="4" fill={col} opacity={col === '#333333' ? 0.3 : 1}/>
+            {latched && (
+              <circle cx={x} cy="14" r="7" fill="none" stroke="#FF3333" strokeWidth="1.5" opacity="0.7">
+                <animate attributeName="r" values="4;12;4" dur="1s" repeatCount="indefinite"/>
+                <animate attributeName="opacity" values="0.8;0;0.8" dur="1s" repeatCount="indefinite"/>
+              </circle>
+            )}
+          </g>
+        );
+      })}
+
+      {/* South stubs */}
+      {southIds.map((id, i) => {
+        const x = txX(i);
+        const col = getColor(id);
+        const latched = isLatched(id);
+        return (
+          <g key={id}>
+            <line x1={x} y1="36" x2={x} y2="52" stroke={col} strokeWidth="3" opacity={col === '#333333' ? 0.3 : 0.9}/>
+            <circle cx={x} cy="38" r="4" fill={col} opacity={col === '#333333' ? 0.3 : 1}/>
+            {latched && (
+              <circle cx={x} cy="38" r="7" fill="none" stroke="#FF3333" strokeWidth="1.5" opacity="0.7">
+                <animate attributeName="r" values="4;12;4" dur="1s" repeatCount="indefinite"/>
+                <animate attributeName="opacity" values="0.8;0;0.8" dur="1s" repeatCount="indefinite"/>
+              </circle>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ── Panel button ───────────────────────────────────────────────────────────────
+
+interface PanelButtonProps {
+  label: string;
+  onClick: () => void;
+  color?: 'green' | 'red' | 'yellow' | 'gray';
+  size?: 'sm' | 'md' | 'lg';
+  disabled?: boolean;
+}
+
+function PanelButton({ label, onClick, color = 'gray', size = 'md', disabled = false }: PanelButtonProps) {
+  const c = {
+    green:  { bg: '#001a00', border: '#006622', text: '#00FF88', glow: 'rgba(0,255,136,0.3)' },
+    red:    { bg: '#1a0000', border: '#660000', text: '#FF4444', glow: 'rgba(255,68,68,0.3)' },
+    yellow: { bg: '#1a1200', border: '#665500', text: '#FFD700', glow: 'rgba(255,215,0,0.3)' },
+    gray:   { bg: '#141414', border: '#3a3a3a', text: '#888', glow: 'none' },
+  }[color];
+  const sz = { sm: 'px-3 py-1.5 text-xs', md: 'px-4 py-2 text-sm', lg: 'px-6 py-2.5 text-base' }[size];
+
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        backgroundColor: disabled ? '#0d0d0d' : c.bg,
+        border: `2px solid ${disabled ? '#2a2a2a' : c.border}`,
+        color: disabled ? '#333' : c.text,
+        boxShadow: disabled ? 'inset 0 2px 4px rgba(0,0,0,0.8)' : `inset 0 2px 4px rgba(0,0,0,0.8), 0 0 8px 1px ${c.glow}`,
+        letterSpacing: '0.08em',
+      }}
+      className={`${sz} rounded font-mono font-bold tracking-widest uppercase transition-all hover:brightness-125 active:scale-95 disabled:cursor-not-allowed`}
+    >
+      {label}
+    </button>
+  );
+}
+
+// ── Indicator pill ─────────────────────────────────────────────────────────────
+
+function Pill({ label, sub, active, color, pulsing = false }: {
+  label: string; sub: string; active: boolean; color: string; pulsing?: boolean;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-1">
+      <div
+        style={{
+          minWidth: 64, height: 28, borderRadius: 4,
+          background: active ? `${color}18` : '#0e0e0e',
+          border: `1.5px solid ${active ? color : '#2a2a2a'}`,
+          boxShadow: active ? `0 0 10px 3px ${color}44` : 'inset 0 2px 4px rgba(0,0,0,0.8)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', paddingInline: 8,
+          animation: pulsing && active ? 'pulseRed 1s ease-in-out infinite' : 'none',
+          transition: 'all 0.3s',
+        }}
+      >
+        <span className="font-mono text-xs font-bold" style={{ color: active ? color : '#2a2a2a' }}>
+          {label}
+        </span>
+      </div>
+      <span className="font-mono text-[10px]" style={{ color: active ? color : '#333' }}>{sub}</span>
+    </div>
+  );
+}
+
+// ── Main page ──────────────────────────────────────────────────────────────────
+
+export function LiveMonitor() {
+  const { state, dispatch, addToast } = useAppStore();
+  const systemState = state.systemState;
+  const taxiways = systemState?.taxiways ?? [];
+  const hasIncursion = taxiways.some(t => t.state === 'INCURSION_LATCHED');
+  const isActive = systemState?.powerState === 'ACTIVE';
+  const isRwyOn = systemState?.runwayProtectionState === 'ON';
+  const rwyOff = isActive && !isRwyOn;
+
+  const getTwState = (id: TaxiwayId): TaxiwayControlState =>
+    taxiways.find(t => t.id === id)?.state ?? 'OFF';
+
+  const northIds = ALL_TAXIWAY_IDS.filter(id => id.endsWith('N')) as TaxiwayId[];
+  const southIds = ALL_TAXIWAY_IDS.filter(id => id.endsWith('S')) as TaxiwayId[];
+
+  const handleTaxiwayClick = useCallback(async (id: TaxiwayId) => {
+    const tw = taxiways.find(t => t.id === id);
+    if (!tw) return;
+    try {
+      if (tw.state === 'INCURSION_LATCHED') {
+        await taxiwayApi.reset(id);
+        addToast({ type: 'success', title: `聯絡道 ${id} 已復歸`, duration: 2000 });
+      } else if (tw.state === 'AUTHORIZED') {
+        await taxiwayApi.revoke(id);
+        addToast({ type: 'info', title: `聯絡道 ${id} 授權已撤銷`, duration: 2000 });
+      } else if (tw.state === 'GUARDED') {
+        await taxiwayApi.authorize(id);
+        addToast({ type: 'success', title: `聯絡道 ${id} 已授權`, duration: 2000 });
+      }
+    } catch (err) {
+      addToast({ type: 'error', title: '操作失敗', message: err instanceof Error ? err.message : '未知錯誤' });
+    }
+  }, [taxiways, addToast]);
+
+  const handleSystemStart = async () => {
+    try { await systemApi.start(); }
+    catch (err) { addToast({ type: 'error', title: 'STM 啟動失敗', message: err instanceof Error ? err.message : '' }); }
+  };
+
+  const handleSystemStop = async () => {
+    try { await systemApi.stop(); }
+    catch (err) { addToast({ type: 'error', title: 'STM 停止失敗', message: err instanceof Error ? err.message : '' }); }
+  };
+
+  const handleRwyEnable = async () => {
+    try { await runwayApi.enable(); }
+    catch (err) { addToast({ type: 'error', title: 'RWY ON 失敗', message: err instanceof Error ? err.message : '' }); }
+  };
+
+  const handleRwyDisable = async () => {
+    try { await runwayApi.disable(); }
+    catch (err) { addToast({ type: 'error', title: 'RWY OFF 失敗', message: err instanceof Error ? err.message : '' }); }
+  };
+
+  return (
+    <div
+      className="h-full overflow-y-auto flex flex-col items-center py-4 px-4"
+      style={{ background: 'linear-gradient(180deg, #0d0d0d 0%, #111 50%, #0d0d0d 100%)' }}
+    >
+      <style>{`
+        @keyframes pulseRed {
+          0%,100% { box-shadow: 0 0 6px 2px rgba(255,51,51,0.7), inset 0 2px 4px rgba(0,0,0,0.5); }
+          50% { box-shadow: 0 0 20px 7px rgba(255,51,51,1), inset 0 2px 4px rgba(0,0,0,0.5); }
+        }
+        @keyframes flashYellow {
+          0%,100% { background-color: rgba(255,215,0,0.12); }
+          50% { background-color: rgba(255,255,200,0.18); }
+        }
+      `}</style>
+
+      {/* ── MAIN PANEL ─────────────────────────────────────────────────── */}
+      <div
+        style={{
+          background: 'linear-gradient(145deg, #1c1c1c, #141414, #1a1a1a)',
+          border: '2.5px solid #333',
+          borderRadius: 12,
+          padding: '18px 20px',
+          boxShadow: '0 0 0 1px #3a3a3a, 0 0 40px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.04)',
+          position: 'relative',
+          maxWidth: 680,
+          width: '100%',
+        }}
+      >
+        {/* Corner screws */}
+        {['top-2.5 left-2.5', 'top-2.5 right-2.5', 'bottom-2.5 left-2.5', 'bottom-2.5 right-2.5'].map((pos, i) => (
+          <svg key={i} className={`absolute ${pos} opacity-35`} width="10" height="10" viewBox="0 0 10 10">
+            <circle cx="5" cy="5" r="4" fill="none" stroke="#777" strokeWidth="1"/>
+            <line x1="3" y1="5" x2="7" y2="5" stroke="#777" strokeWidth="0.8"/>
+            <line x1="5" y1="3" x2="5" y2="7" stroke="#777" strokeWidth="0.8"/>
+          </svg>
+        ))}
+
+        {/* Title */}
+        <div className="text-center mb-3">
+          <div className="font-mono text-[11px] font-bold tracking-[0.28em] uppercase text-[#555]">
+            RUNWAY INCURSION DETECTION PANEL
+          </div>
+        </div>
+
+        {/* ── Status indicators ─────────────────────────────────────────── */}
+        <div
+          className="flex items-center justify-center gap-5 mb-4 py-2.5 px-4 rounded"
+          style={{ background: 'linear-gradient(90deg, #0a0a0a, #161616, #0a0a0a)', border: '1px solid #1e1e1e' }}
+        >
+          <Pill label="STM" sub={systemState?.powerState ?? 'OFF'} active={isActive} color="#00FF88"/>
+          <Pill label="RWY" sub={isRwyOn ? 'ON' : 'OFF'} active={isRwyOn} color="#FFD700"/>
+          <Pill
+            label={hasIncursion ? '⚠ INCURSION' : 'INCURSION'}
+            sub={hasIncursion ? 'ACTIVE' : 'CLEAR'}
+            active={hasIncursion} color="#FF3333" pulsing={hasIncursion}
+          />
+          {/* Audio toggle */}
+          <div className="flex flex-col items-center gap-1">
+            <button
+              onClick={() => dispatch({ type: 'SET_AUDIO_ENABLED', payload: !state.audioEnabled })}
+              style={{
+                width: 36, height: 28, borderRadius: 4,
+                background: state.audioEnabled ? 'rgba(68,136,255,0.12)' : '#0e0e0e',
+                border: `1.5px solid ${state.audioEnabled ? '#4488ff' : '#2a2a2a'}`,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+              }}
+            >
+              {state.audioEnabled
+                ? <Volume2 className="w-4 h-4 text-blue-400"/>
+                : <VolumeX className="w-4 h-4 text-gray-700"/>
+              }
+            </button>
+            <span className="font-mono text-[10px]" style={{ color: state.audioEnabled ? '#4488ff' : '#333' }}>AUDIO</span>
+          </div>
+        </div>
+
+        {/* ── North taxiway row ──────────────────────────────────────────── */}
+        <div className="flex items-center gap-2 mb-1.5">
+          <span className="font-mono text-[10px] text-[#333] w-5 text-center shrink-0 tracking-widest">N</span>
+          <div className="flex-1 grid grid-cols-6 gap-1.5">
+            {northIds.map(id => (
+              <TaxiwayButton key={id} id={id} state={getTwState(id)} onClick={handleTaxiwayClick} rwyOff={rwyOff}/>
+            ))}
+          </div>
+          <div className="w-5 shrink-0"/>
+        </div>
+
+        {/* ── Compact runway SVG ─────────────────────────────────────────── */}
+        <div className="px-7 py-1">
+          <CompactRunway
+            taxiways={taxiways.map(t => ({ id: t.id, state: t.state }))}
+            hasIncursion={hasIncursion}
+            rwyOff={rwyOff}
+          />
+        </div>
+
+        {/* ── South taxiway row ──────────────────────────────────────────── */}
+        <div className="flex items-center gap-2 mt-1.5">
+          <span className="font-mono text-[10px] text-[#333] w-5 text-center shrink-0 tracking-widest">S</span>
+          <div className="flex-1 grid grid-cols-6 gap-1.5">
+            {southIds.map(id => (
+              <TaxiwayButton key={id} id={id} state={getTwState(id)} onClick={handleTaxiwayClick} rwyOff={rwyOff}/>
+            ))}
+          </div>
+          <div className="w-5 shrink-0"/>
+        </div>
+
+        {/* Legend */}
+        <div className="flex gap-3 justify-center flex-wrap mt-2.5 mb-3">
+          {[
+            ['#FFD700', 'GUARDED'], ['#00FF88', 'AUTHORIZED'],
+            ['#FF3333', 'INCURSION'], ['#FFAA00', 'FAULT'],
+            ...(rwyOff ? [['#00AA66', 'RWY-OFF']] : [['#333333', 'OFF']]),
+          ].map(([color, label]) => (
+            <div key={label} className="flex items-center gap-1">
+              <div className="w-2.5 h-2.5 rounded-full" style={{ background: color }}/>
+              <span className="font-mono text-[9px]" style={{ color: '#555' }}>{label}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="w-full h-px mb-3" style={{ background: 'linear-gradient(90deg, transparent, #333, transparent)' }}/>
+
+        {/* ── Controls row ──────────────────────────────────────────────── */}
+        <div className="flex items-center justify-center gap-8">
+          <div className="flex flex-col items-center gap-1.5">
+            <span className="font-mono text-[10px] text-[#333] tracking-widest">RWY CONTROL</span>
+            <div className="flex gap-2">
+              <PanelButton label="RWY ON"  onClick={handleRwyEnable}  color="yellow" disabled={!isActive || isRwyOn}/>
+              <PanelButton label="RWY OFF" onClick={handleRwyDisable} color="red"    disabled={!isActive || !isRwyOn || hasIncursion}/>
+            </div>
+          </div>
+          <div className="w-px h-10" style={{ background: '#2a2a2a' }}/>
+          <div className="flex flex-col items-center gap-1.5">
+            <span className="font-mono text-[10px] text-[#333] tracking-widest">STM CONTROL</span>
+            <div className="flex gap-2">
+              <PanelButton label="STM ON"  onClick={handleSystemStart} color="green" size="lg"
+                disabled={systemState?.powerState === 'ACTIVE' || systemState?.powerState === 'INITIALIZING'}/>
+              <PanelButton label="STM OFF" onClick={handleSystemStop}  color="red"   size="lg"
+                disabled={systemState?.powerState === 'OFF' || hasIncursion}/>
+            </div>
+          </div>
+        </div>
+
+        {/* Footer label */}
+        <div className="text-center mt-3">
+          <div className="font-mono text-[9px] tracking-[0.22em] uppercase text-[#333]">
+            AIRPORT SURFACE MONITORING SYSTEM — DEMO BASE A — RWY 18/36
+          </div>
+        </div>
+      </div>
+
+      {/* Hint */}
+      <div className="mt-2 text-[10px] text-[#333] font-mono text-center">
+        點擊聯絡道：GUARDED → 授權 | AUTHORIZED → 撤銷 | INCURSION → 復歸
+      </div>
+
+      {/* ── Airport simulation panel ────────────────────────────────────── */}
+      <div style={{ maxWidth: 680, width: '100%' }}>
+        <AirportSimPanel
+          taxiways={taxiways}
+          isActive={isActive}
+          isRwyOn={isRwyOn}
+        />
+      </div>
+    </div>
+  );
+}

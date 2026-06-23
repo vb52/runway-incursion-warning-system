@@ -1,0 +1,2064 @@
+<!DOCTYPE html>
+<html class="dark" lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1440">
+<title>RIWS — Chimes AI</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      colors: {
+        panel: '#1a1a1a',
+        'panel-edge': '#222',
+        surface: '#141414',
+        border: { DEFAULT: '#2a2a2a', bright: '#3a3a3a' },
+        status: {
+          yellow: '#FFD700',
+          green:  '#00FF88',
+          red:    '#FF4444',
+          blue:   '#4499FF',
+          gray:   '#666666',
+          purple: '#AA66FF',
+        }
+      },
+      fontFamily: {
+        panel: ['"Share Tech Mono"', '"Courier New"', 'monospace'],
+        ui:    ['Inter', 'system-ui', 'sans-serif'],
+        mono:  ['"JetBrains Mono"', '"Courier New"', 'monospace'],
+      }
+    }
+  }
+}
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; }
+body { font-family: 'Inter', system-ui, sans-serif; }
+
+/* Panel metal texture */
+.panel-metal {
+  background: linear-gradient(145deg, #1e1e1e 0%, #161616 50%, #1a1a1a 100%);
+  position: relative;
+}
+.panel-metal::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(circle, #ffffff08 1px, transparent 1px);
+  background-size: 3px 3px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Corner screw */
+.panel-screw {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #666, #333);
+  border: 1px solid #555;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.panel-screw::before { content: '+'; font-size: 9px; color: #444; font-weight: bold; }
+
+/* Indicator light glass */
+.indicator { position: relative; overflow: hidden; }
+.indicator::after {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0;
+  height: 50%;
+  background: linear-gradient(to bottom, rgba(255,255,255,0.08), transparent);
+  pointer-events: none;
+}
+
+/* Taxiway button */
+.taxiway-btn {
+  transition: all 0.15s;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05);
+  user-select: none; cursor: pointer;
+}
+.taxiway-btn:active {
+  transform: scale(0.95);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.5), inset 0 2px 4px rgba(0,0,0,0.3);
+}
+
+/* Metal push button */
+.metal-btn {
+  background: radial-gradient(circle at 40% 35%, #3a3a3a, #1a1a1a);
+  border: 2px solid #3a3a3a;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.08), inset 0 -1px 0 rgba(0,0,0,0.4);
+  transition: all 0.1s; cursor: pointer; user-select: none;
+}
+.metal-btn:active {
+  transform: scale(0.96) translateY(1px);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.6), inset 0 2px 4px rgba(0,0,0,0.4);
+}
+
+/* Animations */
+@keyframes incursion-pulse {
+  0%, 100% { box-shadow: 0 0 8px #FF444488, 0 0 20px #FF444444; }
+  50%       { box-shadow: 0 0 16px #FF4444cc, 0 0 40px #FF444466; }
+}
+.incursion-active { animation: incursion-pulse 1.5s ease-in-out infinite; }
+
+@keyframes stm-init {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.2; }
+}
+.stm-initializing { animation: stm-init 0.8s ease-in-out infinite; }
+
+@keyframes fault-flash {
+  0%,49%  { background:rgba(170,100,255,0.15); border-color:#AA66FF; color:#AA66FF; }
+  50%,100%{ background:rgba(200,200,255,0.10); border-color:#ccccff; color:#ccccff; }
+}
+.taxiway-fault { animation: fault-flash 0.5s step-end infinite; }
+
+@keyframes indicator-blink {
+  0%,100%{ opacity:1; } 50%{ opacity:0.15; }
+}
+.indicator-blink { animation: indicator-blink 0.8s ease-in-out infinite; }
+
+/* Engraved divider */
+.engraved-line {
+  border: none;
+  border-top: 1px solid #111;
+  border-bottom: 1px solid #333;
+  margin: 0;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0a0a0a; }
+::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
+
+/* Nav active */
+.nav-item { transition: background 0.1s, color 0.1s; }
+.nav-item.active { background: #1a1a1a; color: #e0e0e0; }
+.nav-item:not(.active):hover { background: #141414; }
+
+/* Select element */
+select {
+  background: #1a1a1a; color: #e0e0e0;
+  border: 1px solid #3a3a3a; border-radius: 4px;
+  padding: 4px 8px; font-size: 12px; cursor: pointer;
+  appearance: none; outline: none;
+}
+select:focus { border-color: #4499FF; }
+
+input[type=text], input[type=search] {
+  background: #1a1a1a; color: #e0e0e0;
+  border: 1px solid #3a3a3a; border-radius: 4px;
+  padding: 4px 10px; font-size: 12px; outline: none;
+}
+input:focus { border-color: #4499FF; }
+input::placeholder { color: #555; }
+
+/* Demo drawer */
+#demo-drawer {
+  transition: transform 0.25s ease;
+  transform: translateX(100%);
+}
+#demo-drawer.open { transform: translateX(0); }
+
+/* Dialog overlay */
+.overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.7);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 9999;
+}
+.dialog-box {
+  background: #1a1a1a; border: 1px solid #3a3a3a;
+  border-radius: 8px; padding: 24px; min-width: 320px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.8);
+}
+
+/* Timeline */
+.timeline-line { position: relative; }
+.timeline-line::before {
+  content: ''; position: absolute; left: 15px; top: 0; bottom: 0;
+  width: 2px; background: #2a2a2a;
+}
+
+/* Simulation incursion ring */
+@keyframes sim-inc-ring {
+  0%,100% { transform: scale(1); opacity:0.7; }
+  50%      { transform: scale(2.2); opacity:0; }
+}
+.sim-inc-ring { animation: sim-inc-ring 0.75s ease-out infinite; transform-box:fill-box; transform-origin:center; }
+
+/* Badge */
+.badge {
+  display: inline-flex; align-items: center;
+  padding: 2px 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.05em; text-transform: uppercase;
+}
+.badge-red    { background: rgba(255,68,68,0.2);    color: #FF4444; }
+.badge-yellow { background: rgba(255,215,0,0.2);    color: #FFD700; }
+.badge-green  { background: rgba(0,255,136,0.2);    color: #00FF88; }
+.badge-blue   { background: rgba(68,153,255,0.2);   color: #4499FF; }
+.badge-gray   { background: rgba(102,102,102,0.2);  color: #888888; }
+.badge-purple { background: rgba(170,102,255,0.2);  color: #AA66FF; }
+</style>
+</head>
+<body class="bg-[#0a0a0a] text-[#e0e0e0] h-screen flex overflow-hidden">
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- SIDEBAR -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<aside class="w-56 bg-[#141414] border-r border-[#2a2a2a] flex flex-col shrink-0">
+  <!-- Logo -->
+  <div class="p-4 border-b border-[#2a2a2a]">
+    <div class="text-[10px] font-panel text-[#888] tracking-widest uppercase">Chimes AI</div>
+    <div class="text-sm font-bold text-[#e0e0e0] mt-0.5 tracking-wide">RIWS</div>
+    <div class="text-[10px] text-[#555] mt-1 tracking-wider font-panel">RUNWAY INCURSION WARNING</div>
+  </div>
+
+  <!-- Nav -->
+  <nav class="flex-1 p-2 space-y-0.5">
+    <button onclick="showPage('monitor')" id="nav-monitor"
+      class="nav-item active w-full flex items-center gap-3 px-3 py-2.5 rounded text-left text-sm text-[#e0e0e0]">
+      <i data-lucide="activity" class="w-4 h-4 text-[#00FF88]"></i>
+      <span>即時監控</span>
+      <span class="ml-auto text-[10px] font-panel text-[#888]">MONITOR</span>
+    </button>
+    <button onclick="showPage('events')" id="nav-events"
+      class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded text-left text-sm text-[#888]">
+      <i data-lucide="zap" class="w-4 h-4"></i>
+      <span>事件中心</span>
+      <span class="ml-auto text-[10px] font-panel text-[#555]">EVENTS</span>
+    </button>
+    <button onclick="showPage('event-detail')" id="nav-event-detail"
+      class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded text-left text-sm text-[#888]">
+      <i data-lucide="file-text" class="w-4 h-4"></i>
+      <span>事件詳情</span>
+      <span class="ml-auto text-[10px] font-panel text-[#555]">DETAIL</span>
+    </button>
+    <button onclick="showPage('audit')" id="nav-audit"
+      class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded text-left text-sm text-[#888]">
+      <i data-lucide="shield" class="w-4 h-4"></i>
+      <span>稽核紀錄</span>
+      <span class="ml-auto text-[10px] font-panel text-[#555]">AUDIT</span>
+    </button>
+    <button onclick="showPage('system')" id="nav-system"
+      class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded text-left text-sm text-[#888]">
+      <i data-lucide="settings" class="w-4 h-4"></i>
+      <span>系統狀態</span>
+      <span class="ml-auto text-[10px] font-panel text-[#555]">SYSTEM</span>
+    </button>
+  </nav>
+
+  <!-- Connection status -->
+  <div class="p-3 border-t border-[#2a2a2a]">
+    <div class="flex items-center gap-2 text-xs text-[#555]">
+      <div class="w-1.5 h-1.5 rounded-full bg-[#00FF88] animate-pulse"></div>
+      <span>已連線</span>
+      <span class="ml-auto font-mono text-[10px]">WS:OK</span>
+    </div>
+  </div>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- MAIN -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div class="flex-1 flex flex-col overflow-hidden">
+
+  <!-- Header -->
+  <header class="h-12 bg-[#0f0f0f] border-b border-[#2a2a2a] flex items-center justify-between px-6 shrink-0">
+    <div class="flex items-center gap-4">
+      <span class="text-[#888] font-panel text-xs tracking-widest">CHIMES AI — RIWS</span>
+      <span class="text-[#444] text-xs">Runway Incursion Detection &amp; Status Management</span>
+    </div>
+    <div class="flex items-center gap-4">
+      <div class="flex items-center gap-1.5 text-xs text-[#555]">
+        <div class="w-1.5 h-1.5 rounded-full" id="hdr-stm-dot" style="background:#555"></div>
+        <span class="font-panel" id="hdr-stm-label">STM: OFF</span>
+      </div>
+      <div class="text-xs font-mono text-[#555]" id="clock">2026-06-16 00:00:00</div>
+    </div>
+  </header>
+
+  <!-- Page content -->
+  <main class="flex-1 overflow-auto relative">
+
+    <!-- ════════════════════════════════════════════════ -->
+    <!-- PAGE: MONITOR -->
+    <!-- ════════════════════════════════════════════════ -->
+    <div id="page-monitor" class="h-full flex items-center justify-center p-6">
+
+      <!-- Outer panel frame -->
+      <div class="panel-metal w-full max-w-5xl border border-[#333] rounded-sm"
+           style="box-shadow: inset 0 1px 0 #333, 0 0 0 2px #111, 0 4px 20px rgba(0,0,0,0.8);">
+
+        <!-- Top-left & top-right screws row -->
+        <div class="flex items-center justify-between px-3 pt-3 relative z-10">
+          <div class="panel-screw"></div>
+          <!-- Panel title -->
+          <div class="text-center flex-1 px-4">
+            <div class="font-panel text-[#777] tracking-[0.22em] text-[10px] uppercase">
+              Runway Incursion Detection Panel
+            </div>
+          </div>
+          <div class="panel-screw"></div>
+        </div>
+
+        <hr class="engraved-line mx-3 mt-2 relative z-10">
+
+        <!-- INDICATOR LIGHTS ROW -->
+        <div class="flex items-end justify-around px-8 py-4 relative z-10">
+
+          <!-- RWY ON indicator -->
+          <div class="flex flex-col items-center gap-1.5">
+            <div class="font-panel text-[10px] text-[#666] tracking-[0.15em] uppercase">RWY ON</div>
+            <div id="ind-rwy" class="indicator flex items-center justify-center w-20 h-8 rounded border border-[#333] bg-[#1a1a1a]"
+                 style="transition:all 0.2s">
+              <span class="font-panel text-[11px] tracking-wider text-[#333]" id="ind-rwy-txt">OFF</span>
+            </div>
+          </div>
+
+          <!-- INCURSION indicator -->
+          <div class="flex flex-col items-center gap-1.5">
+            <div class="font-panel text-[10px] text-[#666] tracking-[0.15em] uppercase">INCURSION</div>
+            <div id="ind-incursion" class="indicator flex items-center justify-center w-24 h-8 rounded border border-[#333] bg-[#1a1a1a]"
+                 style="transition:all 0.2s">
+              <span class="font-panel text-[11px] tracking-wider text-[#333]" id="ind-incursion-txt">—</span>
+            </div>
+          </div>
+
+          <!-- SPEAKER indicator -->
+          <div class="flex flex-col items-center gap-1.5">
+            <div class="font-panel text-[10px] text-[#666] tracking-[0.15em] uppercase">SPEAKER</div>
+            <div id="ind-speaker" class="indicator flex items-center justify-center w-20 h-8 rounded border border-[#333] bg-[#1a1a1a] cursor-pointer"
+                 onclick="toggleAudio()" style="transition:all 0.2s">
+              <i data-lucide="volume-x" id="speaker-icon" class="w-4 h-4 text-[#444]"></i>
+            </div>
+          </div>
+
+          <!-- STM ACTIVE indicator -->
+          <div class="flex flex-col items-center gap-1.5">
+            <div class="font-panel text-[10px] text-[#666] tracking-[0.15em] uppercase">STM ACTIVE</div>
+            <div id="ind-stm" class="indicator flex items-center justify-center w-24 h-8 rounded border border-[#333] bg-[#1a1a1a]"
+                 style="transition:all 0.2s">
+              <span class="font-panel text-[11px] tracking-wider text-[#333]" id="ind-stm-txt">OFF</span>
+            </div>
+          </div>
+        </div>
+
+        <hr class="engraved-line mx-3 relative z-10">
+
+        <!-- MAIN PANEL AREA: 1N-6N top | Runway SVG | 1S-6S bottom -->
+        <div class="flex flex-col relative z-10">
+
+          <!-- NORTH row (above runway) -->
+          <div class="flex items-center gap-3 px-6 py-3 border-b border-[#2a2a2a]">
+            <div class="font-panel text-[9px] text-[#555] tracking-[0.2em] uppercase w-6 shrink-0 text-center">N</div>
+            <div class="flex-1 grid grid-cols-6 gap-2">
+              <div id="btn-1N" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('1N')">
+                <span class="font-panel text-[13px] font-bold">1N</span>
+              </div>
+              <div id="btn-2N" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('2N')">
+                <span class="font-panel text-[13px] font-bold">2N</span>
+              </div>
+              <div id="btn-3N" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('3N')">
+                <span class="font-panel text-[13px] font-bold">3N</span>
+              </div>
+              <div id="btn-4N" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('4N')">
+                <span class="font-panel text-[13px] font-bold">4N</span>
+              </div>
+              <div id="btn-5N" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('5N')">
+                <span class="font-panel text-[13px] font-bold">5N</span>
+              </div>
+              <div id="btn-6N" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('6N')">
+                <span class="font-panel text-[13px] font-bold">6N</span>
+              </div>
+            </div>
+            <div class="w-6 shrink-0"></div>
+          </div>
+
+          <!-- Runway SVG (middle) -->
+          <div class="px-6 py-2">
+            <svg id="runway-svg" viewBox="0 0 400 60" style="width:100%;height:60px;display:block;">
+              <defs>
+                <filter id="red-glow" x="-50%" y="-50%" width="200%" height="200%">
+                  <feGaussianBlur stdDeviation="3" result="blur"/>
+                  <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+                </filter>
+              </defs>
+
+              <!-- North stub lines (buttons above → runway) -->
+              <line x1="73"  y1="0" x2="73"  y2="18" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="133" y1="0" x2="133" y2="18" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="193" y1="0" x2="193" y2="18" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="253" y1="0" x2="253" y2="18" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="313" y1="0" x2="313" y2="18" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="353" y1="0" x2="353" y2="18" stroke="#3a3a3a" stroke-width="2"/>
+
+              <!-- Runway rectangle -->
+              <rect x="20" y="18" width="360" height="24" rx="2" fill="#252525" stroke="#777" stroke-width="1.5"/>
+
+              <!-- Center dashes -->
+              <line x1="20" y1="30" x2="380" y2="30" stroke="#bbb" stroke-width="1" stroke-dasharray="12,8" opacity="0.4"/>
+
+              <!-- Runway end labels -->
+              <text x="30" y="34" font-family="'Share Tech Mono',monospace" font-size="11" fill="#aaa" font-weight="bold">18</text>
+              <text x="350" y="34" font-family="'Share Tech Mono',monospace" font-size="11" fill="#aaa" font-weight="bold">36</text>
+
+              <!-- South stub lines (runway → buttons below) -->
+              <line x1="73"  y1="42" x2="73"  y2="60" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="133" y1="42" x2="133" y2="60" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="193" y1="42" x2="193" y2="60" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="253" y1="42" x2="253" y2="60" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="313" y1="42" x2="313" y2="60" stroke="#3a3a3a" stroke-width="2"/>
+              <line x1="353" y1="42" x2="353" y2="60" stroke="#3a3a3a" stroke-width="2"/>
+
+              <!-- Junction dots North -->
+              <circle id="jn-1N" cx="73"  cy="18" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-2N" cx="133" cy="18" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-3N" cx="193" cy="18" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-4N" cx="253" cy="18" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-5N" cx="313" cy="18" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-6N" cx="353" cy="18" r="3.5" fill="#4a4a4a"/>
+
+              <!-- Junction dots South -->
+              <circle id="jn-1S" cx="73"  cy="42" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-2S" cx="133" cy="42" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-3S" cx="193" cy="42" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-4S" cx="253" cy="42" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-5S" cx="313" cy="42" r="3.5" fill="#4a4a4a"/>
+              <circle id="jn-6S" cx="353" cy="42" r="3.5" fill="#4a4a4a"/>
+
+              <!-- Incursion markers (hidden by default) -->
+              <circle id="inc-1N" cx="73"  cy="18" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-2N" cx="133" cy="18" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-3N" cx="193" cy="18" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-4N" cx="253" cy="18" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-5N" cx="313" cy="18" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-6N" cx="353" cy="18" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-1S" cx="73"  cy="42" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-2S" cx="133" cy="42" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-3S" cx="193" cy="42" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-4S" cx="253" cy="42" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-5S" cx="313" cy="42" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+              <circle id="inc-6S" cx="353" cy="42" r="6" fill="#FF4444" opacity="0" filter="url(#red-glow)"/>
+            </svg>
+          </div>
+
+          <!-- SOUTH row (below runway) -->
+          <div class="flex items-center gap-3 px-6 py-3 border-t border-[#2a2a2a]">
+            <div class="font-panel text-[9px] text-[#555] tracking-[0.2em] uppercase w-6 shrink-0 text-center">S</div>
+            <div class="flex-1 grid grid-cols-6 gap-2">
+              <div id="btn-1S" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('1S')">
+                <span class="font-panel text-[13px] font-bold">1S</span>
+              </div>
+              <div id="btn-2S" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('2S')">
+                <span class="font-panel text-[13px] font-bold">2S</span>
+              </div>
+              <div id="btn-3S" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('3S')">
+                <span class="font-panel text-[13px] font-bold">3S</span>
+              </div>
+              <div id="btn-4S" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('4S')">
+                <span class="font-panel text-[13px] font-bold">4S</span>
+              </div>
+              <div id="btn-5S" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('5S')">
+                <span class="font-panel text-[13px] font-bold">5S</span>
+              </div>
+              <div id="btn-6S" class="taxiway-btn flex items-center justify-center bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[#555] h-11" onclick="clickTaxiway('6S')">
+                <span class="font-panel text-[13px] font-bold">6S</span>
+              </div>
+            </div>
+            <div class="w-6 shrink-0"></div>
+          </div>
+
+        </div>
+
+        <hr class="engraved-line mx-3 relative z-10">
+
+        <!-- CONTROL BUTTONS ROW -->
+        <div class="flex items-center justify-between px-8 py-4 relative z-10">
+          <div class="flex items-center gap-6">
+            <!-- RWY ON -->
+            <div class="flex flex-col items-center gap-2">
+              <div class="font-panel text-[10px] text-[#555] tracking-[0.15em] uppercase">RWY ON</div>
+              <button onclick="clickRwyOn()" id="ctrl-rwy-on"
+                class="metal-btn w-12 h-12 rounded-full flex items-center justify-center text-[#888]">
+                <i data-lucide="shield" class="w-5 h-5"></i>
+              </button>
+            </div>
+            <!-- RWY OFF -->
+            <div class="flex flex-col items-center gap-2">
+              <div class="font-panel text-[10px] text-[#555] tracking-[0.15em] uppercase">RWY OFF</div>
+              <button onclick="clickRwyOff()" id="ctrl-rwy-off"
+                class="metal-btn w-12 h-12 rounded-full flex items-center justify-center text-[#888]">
+                <i data-lucide="shield-off" class="w-5 h-5"></i>
+              </button>
+            </div>
+          </div>
+
+          <!-- STM ON/OFF large button -->
+          <div class="flex flex-col items-center gap-2">
+            <div class="font-panel text-[10px] text-[#555] tracking-[0.15em] uppercase">STM SYS</div>
+            <button onclick="clickStm()" id="ctrl-stm"
+              class="metal-btn w-16 h-16 rounded-full flex flex-col items-center justify-center gap-0.5">
+              <i data-lucide="power" class="w-6 h-6 text-[#555]" id="stm-icon"></i>
+              <span class="font-panel text-[9px] tracking-widest text-[#555]" id="stm-btn-label">ON/OFF</span>
+            </button>
+          </div>
+        </div>
+
+        <hr class="engraved-line mx-3 relative z-10">
+
+        <!-- Panel footer -->
+        <div class="flex items-center justify-between px-4 py-2 relative z-10">
+          <div class="flex items-center gap-3">
+            <div class="panel-screw"></div>
+            <span class="font-panel text-[9px] text-[#555] tracking-[0.2em] uppercase">Airport Surface Monitoring System</span>
+          </div>
+          <div class="flex items-center gap-3">
+            <button onclick="toggleDemo()"
+              class="font-panel text-[9px] text-[#555] tracking-wider border border-[#2a2a2a] rounded px-2 py-1 hover:text-[#888] hover:border-[#3a3a3a] transition-colors">
+              DEMO ▶
+            </button>
+            <span class="font-panel text-[9px] text-[#444] tracking-wider">DEMO v1.0</span>
+            <div class="panel-screw"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── AIRPORT SIMULATION ─────────────────────────────────── -->
+      <div class="mt-3 rounded-lg border border-[#2a2a2a] bg-[#0e0e0e] overflow-hidden">
+
+        <!-- Sim header / controls -->
+        <div class="flex items-center justify-between px-4 py-2 border-b border-[#2a2a2a]">
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full" id="sim-status-dot" style="background:#333;box-shadow:none;transition:all 0.3s"></div>
+            <span class="font-panel text-[10px] text-[#666] tracking-widest uppercase">機場地面模擬 / Surface Simulation</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <button onclick="simSetSpeed(0.5)" id="sim-btn-slow"
+              class="font-panel text-[9px] px-2 py-1 rounded border border-[#2a2a2a] text-[#444] hover:text-[#888] hover:border-[#3a3a3a] transition-colors">×½</button>
+            <button onclick="simSetSpeed(1)" id="sim-btn-normal"
+              class="font-panel text-[9px] px-2 py-1 rounded border border-[#FFD700] text-[#FFD700]">×1</button>
+            <button onclick="simSetSpeed(2)" id="sim-btn-fast"
+              class="font-panel text-[9px] px-2 py-1 rounded border border-[#2a2a2a] text-[#444] hover:text-[#888] hover:border-[#3a3a3a] transition-colors">×2</button>
+            <button onclick="simReset()"
+              class="font-panel text-[9px] px-2 py-1 rounded border border-[#2a2a2a] text-[#444] hover:text-[#888] hover:border-[#3a3a3a] transition-colors">↺ 重設</button>
+            <button onclick="toggleSim()" id="sim-toggle-btn"
+              class="font-panel text-[10px] px-3 py-1 rounded border border-[#3a3a3a] text-[#888] hover:border-[#00FF88] hover:text-[#00FF88] transition-colors">▶ 啟動</button>
+          </div>
+        </div>
+
+        <!-- Sim SVG -->
+        <div class="px-3 py-2">
+          <svg id="sim-svg" viewBox="0 0 700 260" style="width:100%;height:auto;display:block">
+            <defs>
+              <filter id="sim-glow-red" x="-80%" y="-80%" width="260%" height="260%">
+                <feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+              <filter id="sim-glow-green" x="-80%" y="-80%" width="260%" height="260%">
+                <feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+            </defs>
+
+            <!-- North apron background -->
+            <rect x="0" y="0" width="700" height="55" fill="#141414" stroke="#222" stroke-width="1"/>
+            <text x="14" y="15" font-family="'Share Tech Mono',monospace" font-size="9" fill="#333" letter-spacing="2">NORTH APRON</text>
+            <!-- Apron parking spots -->
+            <rect x="65"  y="8" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="155" y="8" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="245" y="8" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="335" y="8" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="425" y="8" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="515" y="8" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+
+            <!-- South apron background -->
+            <rect x="0" y="205" width="700" height="55" fill="#141414" stroke="#222" stroke-width="1"/>
+            <text x="14" y="253" font-family="'Share Tech Mono',monospace" font-size="9" fill="#333" letter-spacing="2">SOUTH APRON</text>
+            <!-- Apron parking spots south -->
+            <rect x="65"  y="218" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="155" y="218" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="245" y="218" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="335" y="218" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="425" y="218" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+            <rect x="515" y="218" width="60" height="34" rx="2" fill="none" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="3,4"/>
+
+            <!-- Runway -->
+            <rect x="30" y="110" width="640" height="40" rx="2" fill="#222" stroke="#666" stroke-width="1.5"/>
+            <line x1="30" y1="130" x2="670" y2="130" stroke="#aaa" stroke-width="1" stroke-dasharray="14,10" opacity="0.3"/>
+            <text x="42" y="134" font-family="'Share Tech Mono',monospace" font-size="12" fill="#777" font-weight="bold">18</text>
+            <text x="635" y="134" font-family="'Share Tech Mono',monospace" font-size="12" fill="#777" font-weight="bold">36</text>
+
+            <!-- Taxiway layout (updated by JS) -->
+            <g id="sim-taxiway-layout"></g>
+
+            <!-- Vehicle layer (updated by JS) -->
+            <g id="sim-vehicles"></g>
+          </svg>
+        </div>
+
+        <!-- Legend -->
+        <div class="flex items-center gap-5 px-4 pb-2.5">
+          <div class="flex items-center gap-1.5">
+            <div class="w-2.5 h-2.5 rounded-full" style="background:#4499FF"></div>
+            <span class="font-panel text-[9px] text-[#555]">移動中</span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <div class="w-2.5 h-2.5 rounded-full" style="background:#FFD700"></div>
+            <span class="font-panel text-[9px] text-[#555]">等候授權</span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <div class="w-2.5 h-2.5 rounded-full" style="background:#00FF88"></div>
+            <span class="font-panel text-[9px] text-[#555]">授權通行</span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <div class="w-2.5 h-2.5 rounded-full" style="background:#FF4444"></div>
+            <span class="font-panel text-[9px] text-[#555]">入侵警報</span>
+          </div>
+          <span class="ml-auto font-panel text-[9px] text-[#444]" id="sim-track-count">0 個目標</span>
+        </div>
+      </div>
+      <!-- /AIRPORT SIMULATION -->
+
+      <!-- DEMO DRAWER -->
+      <div id="demo-drawer" class="fixed top-12 right-0 bottom-0 w-56 bg-[#141414] border-l border-[#2a2a2a] z-50 overflow-y-auto"
+           style="transform:translateX(100%); transition:transform 0.25s ease">
+        <div class="p-3 border-b border-[#2a2a2a] flex items-center justify-between">
+          <span class="font-panel text-[10px] text-[#888] tracking-widest">DEMO CONTROL</span>
+          <button onclick="toggleDemo()" class="text-[#555] hover:text-[#888]">
+            <i data-lucide="x" class="w-4 h-4"></i>
+          </button>
+        </div>
+        <div class="p-3 space-y-2">
+          <div class="font-panel text-[9px] text-[#555] tracking-widest uppercase mb-2">情境模擬</div>
+          <button onclick="triggerScenario('stm-on')"
+            class="w-full text-left text-xs px-3 py-2 rounded bg-[#1a1a1a] border border-[#2a2a2a] text-[#888] hover:border-[#00FF88] hover:text-[#00FF88] transition-colors font-mono">
+            1. 啟動 STM
+          </button>
+          <button onclick="triggerScenario('rwy-on')"
+            class="w-full text-left text-xs px-3 py-2 rounded bg-[#1a1a1a] border border-[#2a2a2a] text-[#888] hover:border-[#FFD700] hover:text-[#FFD700] transition-colors font-mono">
+            2. RWY ON
+          </button>
+          <button onclick="triggerScenario('incursion-1n')"
+            class="w-full text-left text-xs px-3 py-2 rounded bg-[#1a1a1a] border border-[#2a2a2a] text-[#888] hover:border-[#FF4444] hover:text-[#FF4444] transition-colors font-mono">
+            3. 1N 入侵
+          </button>
+          <button onclick="triggerScenario('incursion-3s')"
+            class="w-full text-left text-xs px-3 py-2 rounded bg-[#1a1a1a] border border-[#2a2a2a] text-[#888] hover:border-[#FF4444] hover:text-[#FF4444] transition-colors font-mono">
+            4. 3S 入侵
+          </button>
+          <button onclick="triggerScenario('reset-1n')"
+            class="w-full text-left text-xs px-3 py-2 rounded bg-[#1a1a1a] border border-[#2a2a2a] text-[#888] hover:border-[#4499FF] hover:text-[#4499FF] transition-colors font-mono">
+            5. 1N 復歸
+          </button>
+          <button onclick="triggerScenario('reset-all')"
+            class="w-full text-left text-xs px-3 py-2 rounded bg-[#1a1a1a] border border-[#2a2a2a] text-[#888] hover:border-[#888] hover:text-[#e0e0e0] transition-colors font-mono">
+            6. 全部重設
+          </button>
+          <div class="border-t border-[#2a2a2a] pt-2 mt-2">
+            <button onclick="toggleAudio()"
+              class="w-full text-left text-xs px-3 py-2 rounded bg-[#1a1a1a] border border-[#2a2a2a] text-[#888] hover:text-[#e0e0e0] transition-colors font-mono"
+              id="demo-audio-btn">
+              音效：關閉
+            </button>
+          </div>
+          <div class="border-t border-[#2a2a2a] pt-2">
+            <div class="font-panel text-[9px] text-[#555] tracking-widest uppercase mb-2">目前狀態</div>
+            <div class="space-y-1 font-mono text-[10px] text-[#555]">
+              <div>STM: <span id="demo-stm-val" class="text-[#888]">OFF</span></div>
+              <div>RWY: <span id="demo-rwy-val" class="text-[#888]">OFF</span></div>
+              <div>INCURSIONS: <span id="demo-inc-val" class="text-[#888]">0</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- /PAGE MONITOR -->
+
+
+    <!-- ════════════════════════════════════════════════ -->
+    <!-- PAGE: EVENTS -->
+    <!-- ════════════════════════════════════════════════ -->
+    <div id="page-events" class="hidden p-6">
+      <div class="flex items-start justify-between mb-4">
+        <div>
+          <h1 class="text-lg font-semibold text-[#e0e0e0]">事件中心 <span class="text-[#555] font-normal">/ Event Center</span></h1>
+          <p class="text-xs text-[#555] mt-0.5">所有偵測事件與狀態變更紀錄</p>
+        </div>
+        <span class="badge badge-gray font-mono text-[10px]" id="events-count-badge">0 筆紀錄</span>
+      </div>
+
+      <!-- Filters -->
+      <div class="flex items-center gap-3 mb-4 flex-wrap">
+        <select id="filter-severity" onchange="filterEvents()">
+          <option value="">嚴重程度</option>
+          <option value="RED">RED</option>
+          <option value="YELLOW">YELLOW</option>
+          <option value="INFO">INFO</option>
+        </select>
+        <select id="filter-status" onchange="filterEvents()">
+          <option value="">狀態</option>
+          <option value="NEW">NEW</option>
+          <option value="ACKNOWLEDGED">ACKNOWLEDGED</option>
+          <option value="CLOSED">CLOSED</option>
+        </select>
+        <select id="filter-loc" onchange="filterEvents()">
+          <option value="">位置</option>
+          <option value="1N">1N</option>
+          <option value="2N">2N</option>
+          <option value="3S">3S</option>
+          <option value="4N">4N</option>
+          <option value="4S">4S</option>
+        </select>
+        <select id="filter-target" onchange="filterEvents()">
+          <option value="">目標類型</option>
+          <option value="車輛">車輛</option>
+          <option value="人員">人員</option>
+        </select>
+        <div class="relative">
+          <i data-lucide="search" class="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-[#555]"></i>
+          <input type="search" id="filter-search" placeholder="搜尋事件 ID..." class="pl-8 w-48" oninput="filterEvents()">
+        </div>
+        <button onclick="resetFilters()" class="text-xs text-[#555] hover:text-[#888] border border-[#2a2a2a] rounded px-2 py-1 transition-colors">重設篩選</button>
+      </div>
+
+      <!-- Table -->
+      <div class="bg-[#141414] border border-[#2a2a2a] rounded overflow-hidden">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="border-b border-[#2a2a2a] bg-[#111]">
+              <th class="text-left px-4 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">Event ID</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">時間</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">位置</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">目標</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">嚴重程度</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">狀態</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">VLM</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">操作</th>
+            </tr>
+          </thead>
+          <tbody id="events-tbody">
+            <!-- populated by JS -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <!-- /PAGE EVENTS -->
+
+
+    <!-- ════════════════════════════════════════════════ -->
+    <!-- PAGE: EVENT DETAIL -->
+    <!-- ════════════════════════════════════════════════ -->
+    <div id="page-event-detail" class="hidden p-6 max-w-5xl">
+      <!-- Header -->
+      <div class="flex items-start justify-between mb-6">
+        <div>
+          <div class="flex items-center gap-3 mb-1">
+            <button onclick="showPage('events')" class="text-[#555] hover:text-[#888] flex items-center gap-1 text-xs transition-colors">
+              <i data-lucide="chevron-left" class="w-3.5 h-3.5"></i> 返回事件中心
+            </button>
+          </div>
+          <h1 class="text-lg font-semibold text-[#e0e0e0] font-mono">RIWS-20260616-0001</h1>
+          <p class="text-xs text-[#555] mt-0.5">跑道入侵偵測事件 — 1N 滑行道</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button class="flex items-center gap-2 text-xs px-3 py-1.5 rounded bg-[#1a2a4a] border border-[#2A5298] text-[#4499FF] hover:bg-[#1e3258] transition-colors">
+            <i data-lucide="check" class="w-3.5 h-3.5"></i> 確認事件
+          </button>
+          <button class="flex items-center gap-2 text-xs px-3 py-1.5 rounded border border-[#2a2a2a] text-[#888] hover:text-[#AA66FF] hover:border-[#AA66FF] transition-colors">
+            <i data-lucide="zap" class="w-3.5 h-3.5"></i> 執行VLM分析
+          </button>
+          <button class="flex items-center gap-2 text-xs px-3 py-1.5 rounded border border-[#2a2a2a] text-[#555] hover:text-[#888] transition-colors">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> 匯出JSON
+          </button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4">
+        <!-- A: 基本資料 -->
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-3">A. 事件基本資料</div>
+          <div class="grid grid-cols-2 gap-x-6 gap-y-2.5 text-xs">
+            <div class="text-[#555]">事件 ID</div>
+            <div class="font-mono text-[#e0e0e0]">RIWS-20260616-0001</div>
+            <div class="text-[#555]">偵測時間</div>
+            <div class="font-mono text-[#e0e0e0]">2026-06-16 09:06:43</div>
+            <div class="text-[#555]">位置</div>
+            <div class="font-mono text-[#FFD700]">1N 滑行道</div>
+            <div class="text-[#555]">目標類型</div>
+            <div class="text-[#e0e0e0]">車輛 (Vehicle)</div>
+            <div class="text-[#555]">追蹤 ID</div>
+            <div class="font-mono text-[#4499FF]">TRK-20260616-0047</div>
+            <div class="text-[#555]">嚴重程度</div>
+            <div><span class="badge badge-red">RED</span></div>
+            <div class="text-[#555]">狀態</div>
+            <div><span class="badge badge-blue">NEW</span></div>
+            <div class="text-[#555]">STM 狀態</div>
+            <div class="font-mono text-[#00FF88]">ACTIVE</div>
+          </div>
+        </div>
+
+        <!-- B: 即時辨識結果 -->
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-3">B. 即時辨識結果</div>
+          <div class="grid grid-cols-2 gap-x-6 gap-y-2.5 text-xs">
+            <div class="text-[#555]">追蹤 ID</div>
+            <div class="font-mono text-[#4499FF]">TRK-20260616-0047</div>
+            <div class="text-[#555]">目標類型</div>
+            <div class="text-[#e0e0e0]">車輛 (Vehicle)</div>
+            <div class="text-[#555]">車輛 ID</div>
+            <div class="font-mono text-[#e0e0e0]">VEH-001</div>
+            <div class="text-[#555]">辨識信心度</div>
+            <div>
+              <div class="flex items-center gap-2">
+                <div class="flex-1 h-1.5 bg-[#2a2a2a] rounded-full overflow-hidden">
+                  <div class="h-full bg-[#00FF88] rounded-full" style="width:92%"></div>
+                </div>
+                <span class="font-mono text-[#00FF88]">92%</span>
+              </div>
+            </div>
+            <div class="text-[#555]">偵測攝影機</div>
+            <div class="font-mono text-[#e0e0e0]">CAM-01, CAM-02</div>
+            <div class="text-[#555]">速度估算</div>
+            <div class="font-mono text-[#e0e0e0]">12 km/h</div>
+            <div class="text-[#555]">移動方向</div>
+            <div class="text-[#e0e0e0]">跑道方向 (North→South)</div>
+          </div>
+        </div>
+
+        <!-- C: 規則引擎判定 -->
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-3">C. 規則引擎判定</div>
+          <div class="space-y-2 text-xs">
+            <div class="flex items-center gap-2 px-3 py-2 rounded bg-[#111] border border-[#2a2a2a]">
+              <i data-lucide="check" class="w-3.5 h-3.5 text-[#00FF88] shrink-0"></i>
+              <span class="text-[#555]">規則 1:</span>
+              <span class="text-[#e0e0e0]">STM 系統已啟動</span>
+              <span class="ml-auto badge badge-green">ACTIVE</span>
+            </div>
+            <div class="flex items-center gap-2 px-3 py-2 rounded bg-[#111] border border-[#2a2a2a]">
+              <i data-lucide="check" class="w-3.5 h-3.5 text-[#00FF88] shrink-0"></i>
+              <span class="text-[#555]">規則 2:</span>
+              <span class="text-[#e0e0e0]">跑道保護已啟用 (RWY ON)</span>
+              <span class="ml-auto badge badge-yellow">ON</span>
+            </div>
+            <div class="flex items-center gap-2 px-3 py-2 rounded bg-[#111] border border-[#2a2a2a]">
+              <i data-lucide="check" class="w-3.5 h-3.5 text-[#00FF88] shrink-0"></i>
+              <span class="text-[#555]">規則 3:</span>
+              <span class="text-[#e0e0e0]">1N 滑行道狀態為 GUARDED</span>
+              <span class="ml-auto badge badge-yellow">GUARDED</span>
+            </div>
+            <div class="flex items-center gap-2 px-3 py-2 rounded bg-[#1a0808] border border-[#FF4444]">
+              <i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-[#FF4444] shrink-0"></i>
+              <span class="text-[#555]">規則 4:</span>
+              <span class="text-[#e0e0e0]">偵測未授權進入 → INCURSION</span>
+              <span class="ml-auto badge badge-red">INCURSION</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- D: VLM -->
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-3">D. VLM 語意分析</div>
+          <div class="grid grid-cols-2 gap-x-6 gap-y-2.5 text-xs mb-3">
+            <div class="text-[#555]">Provider</div>
+            <div class="text-[#e0e0e0]">Mock</div>
+            <div class="text-[#555]">Model</div>
+            <div class="font-mono text-[#e0e0e0]">RIWS-Mock-VLM</div>
+            <div class="text-[#555]">狀態</div>
+            <div><span class="badge badge-green">COMPLETED</span></div>
+            <div class="text-[#555]">風險等級</div>
+            <div><span class="badge badge-red">CRITICAL</span></div>
+            <div class="text-[#555]">信心度</div>
+            <div class="font-mono text-[#00FF88]">95%</div>
+            <div class="text-[#555]">分析延遲</div>
+            <div class="font-mono text-[#888]">2.3s</div>
+          </div>
+          <div class="bg-[#111] border border-[#2a2a2a] rounded p-3 text-xs text-[#888] leading-relaxed">
+            VLM 分析結果：偵測到一輛地面服務車輛（貨物拖車）在未取得 ATC 授權的情況下進入 1N 滑行道跑道保護區域。車輛行進方向為由北向南穿越跑道。建議立即啟動警告程序並通知相關地勤人員。
+          </div>
+        </div>
+      </div>
+
+      <!-- E: 時間軸 -->
+      <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4 mt-4">
+        <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-4">E. 事件時間軸</div>
+        <div class="timeline-line pl-10 space-y-4">
+          <div class="relative flex items-start gap-3">
+            <div class="absolute left-[-32px] w-8 h-8 rounded-full bg-[#1a1a1a] border border-[#2a2a2a] flex items-center justify-center">
+              <i data-lucide="activity" class="w-3.5 h-3.5 text-[#00FF88]"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-[10px] text-[#555]">09:06:41</span>
+                <span class="badge badge-green text-[9px]">SYSTEM</span>
+              </div>
+              <div class="text-xs text-[#e0e0e0] mt-0.5">STM 系統偵測到 1N 滑行道移動目標</div>
+            </div>
+          </div>
+          <div class="relative flex items-start gap-3">
+            <div class="absolute left-[-32px] w-8 h-8 rounded-full bg-[#1a1a1a] border border-[#2a2a2a] flex items-center justify-center">
+              <i data-lucide="shield" class="w-3.5 h-3.5 text-[#FFD700]"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-[10px] text-[#555]">09:06:42</span>
+                <span class="badge badge-yellow text-[9px]">RULE ENGINE</span>
+              </div>
+              <div class="text-xs text-[#e0e0e0] mt-0.5">規則引擎確認 1N 為 GUARDED 且目標無授權</div>
+            </div>
+          </div>
+          <div class="relative flex items-start gap-3">
+            <div class="absolute left-[-32px] w-8 h-8 rounded-full bg-[#1a0808] border border-[#FF4444] flex items-center justify-center">
+              <i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-[#FF4444]"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-[10px] text-[#555]">09:06:43</span>
+                <span class="badge badge-red text-[9px]">INCURSION</span>
+              </div>
+              <div class="text-xs text-[#e0e0e0] mt-0.5">入侵警報觸發 — 面板狀態變更為 INCURSION_LATCHED</div>
+            </div>
+          </div>
+          <div class="relative flex items-start gap-3">
+            <div class="absolute left-[-32px] w-8 h-8 rounded-full bg-[#1a1a1a] border border-[#AA66FF] flex items-center justify-center">
+              <i data-lucide="zap" class="w-3.5 h-3.5 text-[#AA66FF]"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-[10px] text-[#555]">09:06:45</span>
+                <span class="badge badge-purple text-[9px]">VLM</span>
+              </div>
+              <div class="text-xs text-[#e0e0e0] mt-0.5">VLM 語意分析啟動 (RIWS-Mock-VLM)</div>
+            </div>
+          </div>
+          <div class="relative flex items-start gap-3">
+            <div class="absolute left-[-32px] w-8 h-8 rounded-full bg-[#1a1a1a] border border-[#00FF88] flex items-center justify-center">
+              <i data-lucide="check" class="w-3.5 h-3.5 text-[#00FF88]"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-[10px] text-[#555]">09:06:48</span>
+                <span class="badge badge-green text-[9px]">VLM DONE</span>
+              </div>
+              <div class="text-xs text-[#e0e0e0] mt-0.5">VLM 分析完成，風險等級：CRITICAL，信心度：95%</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- F: 事件影像 -->
+      <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4 mt-4 mb-6">
+        <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-3">F. 事件影像</div>
+        <div class="grid grid-cols-3 gap-3">
+          <div class="aspect-video bg-[#111] border border-[#2a2a2a] rounded flex flex-col items-center justify-center gap-2">
+            <div class="w-full h-full flex flex-col items-center justify-center bg-[#0d1a0d] border border-[#1a3a1a] rounded">
+              <i data-lucide="camera" class="w-6 h-6 text-[#2a5a2a]"></i>
+              <span class="text-[10px] text-[#2a5a2a] mt-2 font-panel tracking-wider">事件前 / PRE-EVENT</span>
+              <span class="text-[9px] text-[#1a3a1a] font-mono mt-1">09:06:30 — CAM-01</span>
+            </div>
+          </div>
+          <div class="aspect-video bg-[#111] border border-[#FF4444] rounded flex flex-col items-center justify-center gap-2">
+            <div class="w-full h-full flex flex-col items-center justify-center bg-[#1a0808] rounded">
+              <i data-lucide="alert-triangle" class="w-6 h-6 text-[#FF4444]"></i>
+              <span class="text-[10px] text-[#FF4444] mt-2 font-panel tracking-wider">偵測瞬間 / DETECTION</span>
+              <span class="text-[9px] text-[#882222] font-mono mt-1">09:06:43 — CAM-01</span>
+            </div>
+          </div>
+          <div class="aspect-video bg-[#111] border border-[#2a2a2a] rounded flex flex-col items-center justify-center gap-2">
+            <div class="w-full h-full flex flex-col items-center justify-center bg-[#0d0d1a] border border-[#1a1a3a] rounded">
+              <i data-lucide="camera" class="w-6 h-6 text-[#2a2a5a]"></i>
+              <span class="text-[10px] text-[#2a2a5a] mt-2 font-panel tracking-wider">事件後 / POST-EVENT</span>
+              <span class="text-[9px] text-[#1a1a3a] font-mono mt-1">09:06:55 — CAM-01</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- /PAGE EVENT DETAIL -->
+
+
+    <!-- ════════════════════════════════════════════════ -->
+    <!-- PAGE: AUDIT -->
+    <!-- ════════════════════════════════════════════════ -->
+    <div id="page-audit" class="hidden p-6">
+      <div class="flex items-start justify-between mb-4">
+        <div>
+          <h1 class="text-lg font-semibold text-[#e0e0e0]">稽核紀錄 <span class="text-[#555] font-normal">/ Audit Log</span></h1>
+          <p class="text-xs text-[#555] mt-0.5">所有操作員操作與系統事件紀錄</p>
+        </div>
+        <span class="badge badge-gray font-mono text-[10px]" id="audit-count-badge">0 筆紀錄</span>
+      </div>
+      <div class="bg-[#141414] border border-[#2a2a2a] rounded overflow-hidden">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="border-b border-[#2a2a2a] bg-[#111]">
+              <th class="text-left px-4 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">時間</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">操作員</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">操作類型</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">對象</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">前一狀態</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">新狀態</th>
+              <th class="text-left px-3 py-2.5 text-[#555] font-medium tracking-wider uppercase text-[10px] font-panel">結果</th>
+            </tr>
+          </thead>
+          <!-- MOCKUP: tbody is populated by simAddAuditEntry() via JS.
+               To connect real backend:
+               1. DELETE simAuditLog, simAddAuditEntry(), renderAuditTable() in JS
+               2. REPLACE with GET /api/audit-logs (AuditService.getLogs)
+               3. Real-time append via socket.on('audit:created', renderAuditTable)
+          -->
+          <tbody id="audit-tbody">
+            <tr><td colspan="7" class="px-4 py-8 text-center text-[#444] font-panel text-[11px]">— 暫無紀錄，請啟動 STM 後操作 —</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <!-- /PAGE AUDIT -->
+
+
+    <!-- ════════════════════════════════════════════════ -->
+    <!-- PAGE: SYSTEM STATUS -->
+    <!-- ════════════════════════════════════════════════ -->
+    <div id="page-system" class="hidden p-6">
+      <div class="flex items-start justify-between mb-4">
+        <div>
+          <h1 class="text-lg font-semibold text-[#e0e0e0]">系統狀態 <span class="text-[#555] font-normal">/ System Status</span></h1>
+          <p class="text-xs text-[#555] mt-0.5">所有系統元件運行狀態總覽</p>
+        </div>
+        <div class="font-mono text-[10px] text-[#555]">最後更新: <span id="sys-updated">—</span></div>
+      </div>
+
+      <!-- Row 1: Core status cards -->
+      <div class="grid grid-cols-4 gap-3 mb-4">
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">STM 狀態</div>
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full bg-[#00FF88] animate-pulse"></div>
+            <span class="text-sm font-semibold text-[#00FF88]" id="sys-stm">ACTIVE</span>
+          </div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">Surface Traffic Monitoring</div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">跑道保護</div>
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full bg-[#666]"></div>
+            <span class="text-sm font-semibold text-[#666]" id="sys-rwy">OFF</span>
+          </div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">RWY 18/36</div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">資料庫</div>
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full bg-[#00FF88] animate-pulse"></div>
+            <span class="text-sm font-semibold text-[#00FF88]">ONLINE</span>
+          </div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">PostgreSQL 15.4</div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">Socket.IO</div>
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full bg-[#00FF88] animate-pulse"></div>
+            <span class="text-sm font-semibold text-[#00FF88]">ONLINE</span>
+          </div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">3 clients connected</div>
+        </div>
+      </div>
+
+      <!-- Row 2: Taxiway mini-cards -->
+      <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4 mb-4">
+        <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-3">滑行道狀態矩陣</div>
+        <div class="grid grid-cols-6 gap-2" id="sys-taxiways">
+          <!-- populated by JS -->
+        </div>
+      </div>
+
+      <!-- Row 3: VLM info -->
+      <div class="grid grid-cols-4 gap-3 mb-4">
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">VLM Provider</div>
+          <div class="text-sm font-semibold text-[#e0e0e0]">Mock</div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">RIWS-Mock-VLM</div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">VLM 模式</div>
+          <div class="text-sm font-semibold text-[#4499FF]">MOCK</div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">Simulation mode</div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">VLM 狀態</div>
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full bg-[#00FF88]"></div>
+            <span class="text-sm font-semibold text-[#00FF88]">Ready</span>
+          </div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">Provider healthy</div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">平均延遲</div>
+          <div class="text-sm font-semibold text-[#FFD700]">2.8s</div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">VLM avg latency</div>
+        </div>
+      </div>
+
+      <!-- Row 4: Stats -->
+      <div class="grid grid-cols-4 gap-3">
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">影像儲存</div>
+          <div class="text-sm font-semibold text-[#e0e0e0]">4.2 GB</div>
+          <div class="text-[10px] text-[#555] mt-2">
+            <div class="h-1 bg-[#2a2a2a] rounded-full overflow-hidden">
+              <div class="h-full bg-[#4499FF] rounded-full" style="width:42%"></div>
+            </div>
+            <span class="font-mono mt-1 block">42% of 10 GB</span>
+          </div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">事件計數</div>
+          <div class="text-xl font-bold text-[#e0e0e0]">6</div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">
+            <span class="text-[#FF4444]">3 RED</span> · <span class="text-[#FFD700]">3 YLW</span>
+          </div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">稽核紀錄</div>
+          <div class="text-xl font-bold text-[#e0e0e0]">8</div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">Today's entries</div>
+        </div>
+        <div class="bg-[#141414] border border-[#2a2a2a] rounded p-4">
+          <div class="text-[10px] font-panel text-[#555] tracking-widest uppercase mb-2">系統運行時間</div>
+          <div class="text-sm font-semibold text-[#00FF88]" id="sys-uptime">01:21:43</div>
+          <div class="text-[10px] text-[#555] mt-2 font-mono">Since 08:00:00</div>
+        </div>
+      </div>
+    </div>
+    <!-- /PAGE SYSTEM -->
+
+  </main>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- CONFIRM DIALOG -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div id="confirm-overlay" class="overlay hidden">
+  <div class="dialog-box">
+    <div class="text-sm font-semibold text-[#e0e0e0] mb-1" id="confirm-title">確認操作</div>
+    <div class="text-xs text-[#888] mb-5" id="confirm-msg">確定要執行此操作嗎？</div>
+    <div class="flex justify-end gap-2">
+      <button onclick="confirmDismiss()" class="text-xs px-4 py-1.5 rounded border border-[#2a2a2a] text-[#888] hover:text-[#e0e0e0] transition-colors">取消</button>
+      <button onclick="confirmAccept()" class="text-xs px-4 py-1.5 rounded bg-[#2A5298] text-white hover:bg-[#3362b8] transition-colors" id="confirm-ok">確認</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- JAVASCRIPT -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<script>
+// ─── State ───────────────────────────────────────────────────
+const state = {
+  stm: 'OFF',   // OFF | INITIALIZING | ACTIVE
+  rwy: 'OFF',   // OFF | ON
+  taxiways: {
+    '1N':'OFF','2N':'OFF','3N':'OFF','4N':'OFF','5N':'OFF','6N':'OFF',
+    '1S':'OFF','2S':'OFF','3S':'OFF','4S':'OFF','5S':'OFF','6S':'OFF',
+  },
+  incursions: new Set(),
+  audio: false,
+};
+
+// ─── Confirm dialog ──────────────────────────────────────────
+let _confirmCallback = null;
+function showConfirm(title, msg, okLabel, cb) {
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-msg').textContent = msg;
+  document.getElementById('confirm-ok').textContent = okLabel || '確認';
+  document.getElementById('confirm-overlay').classList.remove('hidden');
+  _confirmCallback = cb;
+}
+function confirmAccept() {
+  document.getElementById('confirm-overlay').classList.add('hidden');
+  if (_confirmCallback) _confirmCallback();
+  _confirmCallback = null;
+}
+function confirmDismiss() {
+  document.getElementById('confirm-overlay').classList.add('hidden');
+  _confirmCallback = null;
+}
+
+// ─── Panel update ─────────────────────────────────────────────
+function applyTaxiwayBtn(id, twState, rwyOff) {
+  const el = document.getElementById('btn-' + id);
+  if (!el) return;
+  el.classList.remove('incursion-active', 'taxiway-fault');
+  el.style.animation = '';
+
+  const offStyle = rwyOff
+    ? { bg:'rgba(0,255,136,0.06)', border:'#007744', color:'#00AA66', shadow:'0 0 6px #00FF8818' }
+    : { bg:'#1a1a1a',              border:'#2a2a2a', color:'#555',    shadow:'' };
+
+  const configs = {
+    'OFF':               offStyle,
+    'GUARDED':           { bg:'rgba(255,215,0,0.08)',   border:'#FFD700', color:'#FFD700', shadow:'0 0 12px #FFD70055' },
+    'AUTHORIZED':        { bg:'rgba(0,255,136,0.08)',   border:'#00FF88', color:'#00FF88', shadow:'0 0 12px #00FF8855' },
+    'INCURSION_LATCHED': { bg:'rgba(255,68,68,0.15)',   border:'#FF4444', color:'#FF4444', shadow:'0 0 16px #FF444488' },
+    'FAULT':             { bg:'rgba(170,100,255,0.15)', border:'#AA66FF', color:'#AA66FF', shadow:'' },
+  };
+  const cfg = configs[twState] || offStyle;
+  el.style.background = cfg.bg;
+  el.style.borderColor = cfg.border;
+  el.style.color = cfg.color;
+  el.style.boxShadow = cfg.shadow ? cfg.shadow + ', 0 2px 4px rgba(0,0,0,0.5)' : '0 2px 4px rgba(0,0,0,0.5)';
+  if (twState === 'INCURSION_LATCHED') el.classList.add('incursion-active');
+  if (twState === 'FAULT') el.classList.add('taxiway-fault');
+}
+
+function updatePanel() {
+  // STM indicator
+  const indStm = document.getElementById('ind-stm');
+  const indStmTxt = document.getElementById('ind-stm-txt');
+  indStm.classList.remove('stm-initializing', 'indicator-blink');
+  if (state.stm === 'OFF') {
+    indStm.style.background = '#1a1a1a';
+    indStm.style.borderColor = '#333';
+    indStm.style.boxShadow = '';
+    indStmTxt.style.color = '#333';
+    indStmTxt.textContent = 'OFF';
+  } else if (state.stm === 'INITIALIZING') {
+    indStm.style.background = 'rgba(0,255,136,0.15)';
+    indStm.style.borderColor = '#00FF88';
+    indStm.style.boxShadow = '0 0 12px #00FF8866';
+    indStmTxt.style.color = '#00FF88';
+    indStmTxt.textContent = 'INIT...';
+    indStm.classList.add('stm-initializing');
+  } else {
+    indStm.style.background = 'rgba(0,255,136,0.15)';
+    indStm.style.borderColor = '#00FF88';
+    indStm.style.boxShadow = '0 0 12px #00FF8866';
+    indStmTxt.style.color = '#00FF88';
+    indStmTxt.textContent = 'ACTIVE';
+  }
+
+  // Header STM dot
+  const dot = document.getElementById('hdr-stm-dot');
+  const lbl = document.getElementById('hdr-stm-label');
+  if (state.stm === 'ACTIVE') { dot.style.background = '#00FF88'; lbl.textContent = 'STM: ACTIVE'; }
+  else if (state.stm === 'INITIALIZING') { dot.style.background = '#FFD700'; lbl.textContent = 'STM: INIT'; }
+  else { dot.style.background = '#555'; lbl.textContent = 'STM: OFF'; }
+
+  // STM button
+  const stmIcon = document.getElementById('stm-icon');
+  const stmBtnLbl = document.getElementById('stm-btn-label');
+  if (state.stm === 'ACTIVE') {
+    stmIcon.style.color = '#00FF88';
+    stmBtnLbl.style.color = '#00FF88';
+    document.getElementById('ctrl-stm').style.boxShadow = '0 0 16px #00FF8844, 0 4px 8px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.08)';
+  } else {
+    stmIcon.style.color = '#555';
+    stmBtnLbl.style.color = '#555';
+    document.getElementById('ctrl-stm').style.boxShadow = '';
+  }
+
+  // RWY indicator
+  const indRwy = document.getElementById('ind-rwy');
+  const indRwyTxt = document.getElementById('ind-rwy-txt');
+  if (state.rwy === 'ON') {
+    indRwy.style.background = 'rgba(255,215,0,0.15)';
+    indRwy.style.borderColor = '#FFD700';
+    indRwy.style.boxShadow = '0 0 12px #FFD70066';
+    indRwyTxt.style.color = '#FFD700';
+    indRwyTxt.textContent = 'ON';
+  } else {
+    indRwy.style.background = '#1a1a1a';
+    indRwy.style.borderColor = '#333';
+    indRwy.style.boxShadow = '';
+    indRwyTxt.style.color = '#333';
+    indRwyTxt.textContent = 'OFF';
+  }
+
+  // INCURSION indicator
+  const indInc = document.getElementById('ind-incursion');
+  const indIncTxt = document.getElementById('ind-incursion-txt');
+  indInc.classList.remove('incursion-active');
+  if (state.incursions.size > 0) {
+    indInc.style.background = 'rgba(255,68,68,0.15)';
+    indInc.style.borderColor = '#FF4444';
+    indInc.style.boxShadow = '0 0 16px #FF444488';
+    indIncTxt.style.color = '#FF4444';
+    indIncTxt.textContent = '!' + [...state.incursions].join(',');
+    indInc.classList.add('incursion-active');
+  } else {
+    indInc.style.background = '#1a1a1a';
+    indInc.style.borderColor = '#333';
+    indInc.style.boxShadow = '';
+    indIncTxt.style.color = '#333';
+    indIncTxt.textContent = '—';
+  }
+
+  // Taxiway buttons
+  const rwyOff = state.stm === 'ACTIVE' && state.rwy === 'OFF';
+  Object.entries(state.taxiways).forEach(([id, s]) => applyTaxiwayBtn(id, s, rwyOff));
+
+  // SVG junction dots & incursion markers
+  const offDotColor = rwyOff ? '#00AA66' : '#4a4a4a';
+  const colors = { OFF: offDotColor, GUARDED:'#FFD700', AUTHORIZED:'#00FF88', INCURSION_LATCHED:'#FF4444', FAULT:'#AA66FF' };
+  Object.entries(state.taxiways).forEach(([id, s]) => {
+    const jn = document.getElementById('jn-' + id);
+    if (jn) jn.setAttribute('fill', colors[s] || offDotColor);
+    const inc = document.getElementById('inc-' + id);
+    if (inc) inc.setAttribute('opacity', s === 'INCURSION_LATCHED' ? '1' : '0');
+  });
+
+  // Speaker
+  updateSpeakerIcon();
+
+  // Demo state display
+  document.getElementById('demo-stm-val').textContent = state.stm;
+  document.getElementById('demo-rwy-val').textContent = state.rwy;
+  document.getElementById('demo-inc-val').textContent = state.incursions.size;
+
+  // System page taxiways
+  updateSystemTaxiways();
+
+  // System page STM/RWY
+  const sysStm = document.getElementById('sys-stm');
+  if (sysStm) {
+    sysStm.textContent = state.stm;
+    sysStm.style.color = state.stm === 'ACTIVE' ? '#00FF88' : '#666';
+  }
+  const sysRwy = document.getElementById('sys-rwy');
+  if (sysRwy) {
+    sysRwy.textContent = state.rwy;
+    sysRwy.style.color = state.rwy === 'ON' ? '#FFD700' : '#666';
+  }
+
+  // Airport simulation taxiway colors
+  simRenderTaxiways();
+}
+
+function updateSystemTaxiways() {
+  const container = document.getElementById('sys-taxiways');
+  if (!container) return;
+  const colors = { OFF:'#333', GUARDED:'#FFD700', AUTHORIZED:'#00FF88', INCURSION_LATCHED:'#FF4444', FAULT:'#AA66FF' };
+  const bgColors = { OFF:'#1a1a1a', GUARDED:'rgba(255,215,0,0.1)', AUTHORIZED:'rgba(0,255,136,0.1)', INCURSION_LATCHED:'rgba(255,68,68,0.15)', FAULT:'rgba(170,102,255,0.15)' };
+  container.innerHTML = Object.entries(state.taxiways).map(([id, s]) => `
+    <div style="background:${bgColors[s]||'#1a1a1a'};border:1px solid ${colors[s]||'#2a2a2a'};border-radius:6px;padding:8px 4px;text-align:center">
+      <div style="font-family:'Share Tech Mono',monospace;font-size:13px;font-weight:bold;color:${colors[s]||'#555'}">${id}</div>
+      <div style="font-size:9px;color:${colors[s]||'#444'};font-family:'Share Tech Mono',monospace;margin-top:2px;letter-spacing:0.05em">${s.replace('_LATCHED','').replace('INCURSION','INC')}</div>
+    </div>
+  `).join('');
+}
+
+function updateSpeakerIcon() {
+  const icon = document.getElementById('speaker-icon');
+  const ind = document.getElementById('ind-speaker');
+  if (!icon || !ind) return;
+  if (state.audio) {
+    icon.setAttribute('data-lucide', 'volume-2');
+    ind.style.borderColor = '#00FF88';
+    ind.style.background = 'rgba(0,255,136,0.1)';
+    icon.style.color = '#00FF88';
+  } else {
+    icon.setAttribute('data-lucide', 'volume-x');
+    ind.style.borderColor = '#333';
+    ind.style.background = '#1a1a1a';
+    icon.style.color = '#444';
+  }
+  document.getElementById('demo-audio-btn').textContent = '音效：' + (state.audio ? '開啟' : '關閉');
+  lucide.createIcons();
+}
+
+// ─── Panel interactions ───────────────────────────────────────
+function clickStm() {
+  if (state.stm === 'OFF') {
+    state.stm = 'INITIALIZING';
+    updatePanel();
+    setTimeout(() => {
+      state.stm = 'ACTIVE';
+      updatePanel();
+      // MOCKUP HOOK — DELETE when connecting real backend (server logs via AuditService)
+      simAddAuditEntry('OPR-001', 'STM_ACTIVATED', 'STM', 'OFF', 'ACTIVE', 'SUCCESS');
+    }, 2000);
+  } else if (state.stm === 'ACTIVE') {
+    showConfirm('關閉 STM 系統', '確定要關閉 Surface Traffic Monitoring 系統？所有跑道保護將解除。', '確認關閉', () => {
+      state.stm = 'OFF';
+      state.rwy = 'OFF';
+      Object.keys(state.taxiways).forEach(k => state.taxiways[k] = 'OFF');
+      state.incursions.clear();
+      // MOCKUP HOOK — DELETE when connecting real backend
+      simAddAuditEntry('OPR-001', 'STM_DEACTIVATED', 'STM', 'ACTIVE', 'OFF', 'SUCCESS');
+      updatePanel();
+    });
+  }
+}
+
+function clickRwyOn() {
+  if (state.stm !== 'ACTIVE') {
+    showConfirm('操作受阻', 'STM 系統未啟動，無法啟用跑道保護。請先啟動 STM。', '了解', null);
+    return;
+  }
+  if (state.rwy === 'ON') return;
+  state.rwy = 'ON';
+  Object.keys(state.taxiways).forEach(k => {
+    if (state.taxiways[k] === 'OFF') state.taxiways[k] = 'GUARDED';
+  });
+  // MOCKUP HOOK — DELETE when connecting real backend
+  simAddAuditEntry('OPR-001', 'RUNWAY_PROTECTION_ON', 'RWY 18/36', 'OFF', 'ON', 'SUCCESS');
+  updatePanel();
+}
+
+function clickRwyOff() {
+  if (state.incursions.size > 0) {
+    showConfirm('操作受阻', '存在未復歸的入侵警報，請先解除所有 INCURSION_LATCHED 狀態。', '了解', null);
+    return;
+  }
+  if (state.rwy === 'OFF') return;
+  showConfirm('關閉跑道保護', '確定要關閉跑道保護？所有滑行道授權將清除。', '確認關閉', () => {
+    state.rwy = 'OFF';
+    Object.keys(state.taxiways).forEach(k => state.taxiways[k] = 'OFF');
+    // MOCKUP HOOK — DELETE when connecting real backend
+    simAddAuditEntry('OPR-001', 'RUNWAY_PROTECTION_OFF', 'RWY 18/36', 'ON', 'OFF', 'SUCCESS');
+    updatePanel();
+  });
+}
+
+function clickTaxiway(id) {
+  if (state.rwy !== 'ON') return;
+  const cur = state.taxiways[id];
+  if (cur === 'GUARDED') {
+    state.taxiways[id] = 'AUTHORIZED';
+    // MOCKUP HOOK — DELETE when connecting real backend
+    simAddAuditEntry('OPR-001', 'TAXIWAY_AUTHORIZED', id, 'GUARDED', 'AUTHORIZED', 'SUCCESS');
+  } else if (cur === 'AUTHORIZED') {
+    state.taxiways[id] = 'GUARDED';
+    // MOCKUP HOOK — DELETE when connecting real backend
+    simAddAuditEntry('OPR-001', 'TAXIWAY_GUARDED', id, 'AUTHORIZED', 'GUARDED', 'SUCCESS');
+  } else if (cur === 'INCURSION_LATCHED') {
+    state.taxiways[id] = 'GUARDED';
+    state.incursions.delete(id);
+    // MOCKUP HOOK — DELETE when connecting real backend
+    simAddAuditEntry('OPR-001', 'TAXIWAY_INCURSION_RESET', id, 'INCURSION_LATCHED', 'GUARDED', 'SUCCESS');
+  }
+  updatePanel();
+}
+
+function toggleAudio() {
+  state.audio = !state.audio;
+  updateSpeakerIcon();
+}
+
+// ─── Demo drawer ─────────────────────────────────────────────
+let demoOpen = false;
+function toggleDemo() {
+  demoOpen = !demoOpen;
+  const drawer = document.getElementById('demo-drawer');
+  if (demoOpen) drawer.classList.add('open');
+  else drawer.classList.remove('open');
+}
+
+function triggerScenario(name) {
+  switch (name) {
+    case 'stm-on':
+      if (state.stm === 'OFF') {
+        state.stm = 'INITIALIZING'; updatePanel();
+        setTimeout(() => { state.stm = 'ACTIVE'; updatePanel(); }, 2000);
+      }
+      break;
+    case 'rwy-on':
+      if (state.stm === 'ACTIVE' && state.rwy === 'OFF') {
+        state.rwy = 'ON';
+        Object.keys(state.taxiways).forEach(k => { if (state.taxiways[k]==='OFF') state.taxiways[k]='GUARDED'; });
+        updatePanel();
+      }
+      break;
+    case 'incursion-1n':
+      if (state.taxiways['1N'] !== 'OFF') {
+        state.taxiways['1N'] = 'INCURSION_LATCHED';
+        state.incursions.add('1N');
+        updatePanel();
+      }
+      break;
+    case 'incursion-3s':
+      if (state.taxiways['3S'] !== 'OFF') {
+        state.taxiways['3S'] = 'INCURSION_LATCHED';
+        state.incursions.add('3S');
+        updatePanel();
+      }
+      break;
+    case 'reset-1n':
+      if (state.taxiways['1N'] === 'INCURSION_LATCHED') {
+        state.taxiways['1N'] = 'GUARDED';
+        state.incursions.delete('1N');
+        updatePanel();
+      }
+      break;
+    case 'reset-all':
+      state.stm = 'OFF'; state.rwy = 'OFF';
+      Object.keys(state.taxiways).forEach(k => state.taxiways[k] = 'OFF');
+      state.incursions.clear();
+      updatePanel();
+      break;
+  }
+}
+
+// ─── Airport Simulation ───────────────────────────────────────
+// Taxiway centerlines in SVG coords (x). Indices 0-5 = 1x-6x
+const SIM_TX_X = [105, 195, 285, 375, 465, 555];
+
+// SVG Y positions: NA=North Apron, NJ=North Junction, RC=Runway Centerline, SJ=South Junction, SA=South Apron
+const SIMY = { NA:27, NJ:110, RC:130, SJ:150, SA:233 };
+
+// Movement speeds (progress/second at ×1).  All phases are deliberately slow for realism.
+const SIM_SPD = {
+  taxi:    0.026,  // ~38s  apron ↔ junction taxiing
+  enter:   0.22,   // ~4.5s crossing junction → runway centerline
+  takeoff: 0.083,  // ~12s  takeoff roll (easeIn = slow start, fast exit)
+  land:    0.028,  // ~36s  landing roll (easeOut = fast entry, slow stop)
+  vacate:  0.22,   // ~4.5s exiting runway to junction
+  svc:     0.022,  // ~45s  ground service vehicle
+};
+
+// Traffic scenario templates
+// DEPART: taxis out from apron → junction → enters runway → accelerates east, exits
+// LAND:   appears at west runway edge → decelerates east → exits at taxiway → taxis in
+// VEHICLE: service vehicle, stops short of junction, holds, returns
+const SIM_TEMPLATES = [
+  { id:'A1', type:'DEPART', side:'N', txIdx:0, startDelay:2000  },
+  { id:'A2', type:'DEPART', side:'S', txIdx:1, startDelay:15000 },
+  { id:'A3', type:'DEPART', side:'N', txIdx:2, startDelay:28000 },
+  { id:'A4', type:'DEPART', side:'S', txIdx:3, startDelay:43000 },
+  { id:'A5', type:'DEPART', side:'N', txIdx:4, startDelay:57000 },
+  { id:'A6', type:'DEPART', side:'S', txIdx:5, startDelay:72000 },
+  { id:'L1', type:'LAND', exitTxIdx:1, exitSide:'S', startDelay:22000 },
+  { id:'L2', type:'LAND', exitTxIdx:3, exitSide:'N', startDelay:50000 },
+  { id:'L3', type:'LAND', exitTxIdx:5, exitSide:'S', startDelay:82000 },
+  { id:'V1', type:'VEHICLE', side:'N', txIdx:0, startDelay:8000  },
+  { id:'V2', type:'VEHICLE', side:'S', txIdx:2, startDelay:36000 },
+  { id:'V3', type:'VEHICLE', side:'N', txIdx:4, startDelay:64000 },
+];
+
+// Easing: landing decelerates (fast→slow), takeoff accelerates (slow→fast)
+function simEaseOut(t) { return 2*t - t*t; }   // landing roll
+function simEaseIn(t)  { return t*t*t; }        // takeoff roll
+
+const simCfg = { running:false, speed:1.0, animId:null, lastTs:0, vehicles:[] };
+
+function simMakeVehicle(tmpl) {
+  return {
+    id:         tmpl.id,
+    type:       tmpl.type,
+    side:       tmpl.side || 'N',
+    txIdx:      tmpl.txIdx !== undefined ? tmpl.txIdx : 0,
+    exitTxIdx:  tmpl.exitTxIdx !== undefined ? tmpl.exitTxIdx : 0,
+    exitSide:   tmpl.exitSide || 'N',
+    state:      'WAITING',   // WAITING | ACTIVE | INCURSION | DONE
+    phase:      tmpl.type === 'LAND' ? 'LAND_ROLL' : tmpl.type === 'VEHICLE' ? 'SVC_OUT' : 'TAXI_OUT',
+    progress:   0,
+    startDelay: tmpl.startDelay || 0,
+    holdTimer:  0,
+    doneTimer:  0,
+    incTriggered: false,
+    reversing:  false,
+  };
+}
+
+function simInitVehicles() {
+  simCfg.vehicles = SIM_TEMPLATES.map(simMakeVehicle);
+}
+
+function simVehicleXY(v) {
+  const { NA, NJ, RC, SJ, SA } = SIMY;
+  const x   = SIM_TX_X[v.txIdx];
+  const ex  = SIM_TX_X[v.exitTxIdx];
+  const aY  = v.side === 'N' ? NA : SA;
+  const jY  = v.side === 'N' ? NJ : SJ;
+  const eJY = v.exitSide === 'N' ? NJ : SJ;
+  const eAY = v.exitSide === 'N' ? NA : SA;
+  const p   = v.progress;
+
+  switch (v.phase) {
+    case 'TAXI_OUT':     return { x, y: aY + (jY  - aY)  * Math.min(p, 1) };
+    case 'AT_JUNCTION':  return { x, y: jY };
+    case 'ENTER_RWY':    return { x, y: jY + (RC  - jY)  * p };
+    case 'TAKEOFF_ROLL': return { x: x + (720 - x) * simEaseIn(Math.min(p,1)), y: RC };
+    case 'LAND_ROLL':    return { x: 30 + (ex - 30) * simEaseOut(Math.min(p,1)), y: RC };
+    case 'VACATE_RWY':   return { x: ex, y: RC  + (eJY - RC)  * p };
+    case 'TAXI_IN':      return { x: ex, y: eJY + (eAY - eJY) * p };
+    case 'SVC_OUT': {
+      const hY = aY + (jY - aY) * 0.88;
+      return { x, y: aY + (hY - aY) * Math.min(p, 1) };
+    }
+    case 'SVC_HOLD': {
+      return { x, y: aY + (jY - aY) * 0.88 };
+    }
+    case 'SVC_RETURN': {
+      const hY = aY + (jY - aY) * 0.88;
+      return { x, y: hY + (aY - hY) * p };
+    }
+    default: return { x, y: aY };
+  }
+}
+
+function simVehicleColor(v) {
+  if (v.state === 'INCURSION' || v.reversing) return '#FF4444';
+  switch (v.phase) {
+    case 'TAKEOFF_ROLL':            return '#00CCFF';
+    case 'LAND_ROLL':               return '#E8F4FF';
+    case 'ENTER_RWY': case 'VACATE_RWY': return '#00FF88';
+    case 'AT_JUNCTION':             return '#FFD700';
+    case 'TAXI_OUT': return v.progress > 0.82 ? '#FFBB00' : '#4499FF';
+    case 'TAXI_IN':                 return '#4499FF';
+    default:                        return v.type === 'VEHICLE' ? '#AA66FF' : '#4499FF';
+  }
+}
+
+// Returns true if panel update needed
+function simStep(v, dtMs) {
+  const dt = dtMs / 1000 * simCfg.speed;
+
+  if (v.state === 'WAITING') {
+    v.startDelay -= dtMs * simCfg.speed;
+    if (v.startDelay <= 0) v.state = 'ACTIVE';
+    return false;
+  }
+
+  if (v.state === 'DONE') {
+    v.doneTimer -= dtMs;
+    if (v.doneTimer <= 0) {
+      const t = SIM_TEMPLATES.find(t => t.id === v.id);
+      if (t) { Object.assign(v, simMakeVehicle(t)); v.startDelay = 8000 + Math.random()*20000; }
+    }
+    return false;
+  }
+
+  if (v.state === 'INCURSION') {
+    // Wait for operator to clear the alarm
+    const twId = `${v.txIdx+1}${v.side}`;
+    if (state.taxiways[twId] !== 'INCURSION_LATCHED') {
+      // Cleared — vehicle reverses away from junction
+      v.state = 'ACTIVE'; v.reversing = true; v.phase = 'TAXI_OUT'; v.progress = 0.97;
+    }
+    return false;
+  }
+
+  if (v.reversing) {
+    v.progress -= SIM_SPD.taxi * dt * 2.5;
+    if (v.progress <= 0) {
+      v.reversing = false; v.incTriggered = false;
+      v.state = 'DONE'; v.doneTimer = 5000 + Math.random()*12000;
+    }
+    return false;
+  }
+
+  switch (v.phase) {
+    case 'TAXI_OUT':
+      v.progress += SIM_SPD.taxi * dt;
+      if (v.progress >= 1) { v.progress = 1; v.phase = 'AT_JUNCTION'; v.holdTimer = 2800; }
+      break;
+
+    case 'AT_JUNCTION': {
+      v.holdTimer -= dtMs * simCfg.speed;
+      if (v.holdTimer > 0) break;
+      const twId = `${v.txIdx+1}${v.side}`;
+      const tw = state.taxiways[twId];
+      if (tw === 'AUTHORIZED') {
+        v.phase = 'ENTER_RWY'; v.progress = 0;
+      } else if (tw === 'GUARDED' && !v.incTriggered) {
+        // Aircraft crossed junction without authorization → incursion
+        v.incTriggered = true; v.state = 'INCURSION';
+        state.taxiways[twId] = 'INCURSION_LATCHED';
+        state.incursions.add(twId);
+        // MOCKUP HOOK — DELETE when connecting real backend
+        // Real events: STM sensor pipeline writes event via POST /api/events → EventService.createEvent()
+        simAddIncursionEvent(twId, v.id, v.type);
+        // Real audit: AuditService.log() called server-side inside the STM alarm handler
+        simAddAuditEntry('SYSTEM', 'INCURSION_DETECTED', twId, 'GUARDED', 'INCURSION_LATCHED', 'ALARM');
+        return true;
+      } else if (tw !== 'GUARDED') {
+        // Taxiway OFF or already latched — back away
+        v.reversing = true;
+      }
+      // tw === GUARDED && incTriggered → state already INCURSION (handled above)
+      break;
+    }
+
+    case 'ENTER_RWY':
+      v.progress += SIM_SPD.enter * dt;
+      if (v.progress >= 1) { v.phase = 'TAKEOFF_ROLL'; v.progress = 0; }
+      break;
+
+    case 'TAKEOFF_ROLL':
+      v.progress += SIM_SPD.takeoff * dt;
+      if (v.progress >= 1) { v.state = 'DONE'; v.doneTimer = 12000 + Math.random()*22000; }
+      break;
+
+    // Landing aircraft: enter from west (x=30), decelerate east, exit via assigned taxiway
+    case 'LAND_ROLL':
+      v.progress += SIM_SPD.land * dt;
+      if (v.progress >= 1) { v.phase = 'VACATE_RWY'; v.progress = 0; }
+      break;
+
+    case 'VACATE_RWY':
+      v.progress += SIM_SPD.vacate * dt;
+      if (v.progress >= 1) { v.phase = 'TAXI_IN'; v.progress = 0; }
+      break;
+
+    case 'TAXI_IN':
+      v.progress += SIM_SPD.taxi * dt;
+      if (v.progress >= 1) { v.state = 'DONE'; v.doneTimer = 10000 + Math.random()*20000; }
+      break;
+
+    // Ground service vehicle: stops 88% of the way to junction, holds, returns
+    case 'SVC_OUT':
+      v.progress += SIM_SPD.svc * dt;
+      if (v.progress >= 1) { v.progress = 1; v.phase = 'SVC_HOLD'; v.holdTimer = 12000 + Math.random()*10000; }
+      break;
+
+    case 'SVC_HOLD':
+      v.holdTimer -= dtMs * simCfg.speed;
+      if (v.holdTimer <= 0) { v.phase = 'SVC_RETURN'; v.progress = 0; }
+      break;
+
+    case 'SVC_RETURN':
+      v.progress += SIM_SPD.svc * dt;
+      if (v.progress >= 1) { v.state = 'DONE'; v.doneTimer = 6000 + Math.random()*14000; }
+      break;
+  }
+  return false;
+}
+
+function simFrame(ts) {
+  if (!simCfg.running) return;
+  const dtMs = Math.min(ts - simCfg.lastTs, 100);
+  simCfg.lastTs = ts;
+  let needPanel = false;
+  simCfg.vehicles.forEach(v => { if (simStep(v, dtMs)) needPanel = true; });
+  if (needPanel) updatePanel();
+  simRenderVehicles();
+  simCfg.animId = requestAnimationFrame(simFrame);
+}
+
+function simRenderVehicles() {
+  const g = document.getElementById('sim-vehicles');
+  if (!g) return;
+  const visible = simCfg.vehicles.filter(v => v.state === 'ACTIVE' || v.state === 'INCURSION');
+  g.innerHTML = visible.map(v => {
+    const { x, y } = simVehicleXY(v);
+    const col = simVehicleColor(v);
+    const gf = v.state === 'INCURSION' ? 'filter:url(#sim-glow-red)' :
+               (v.phase === 'TAKEOFF_ROLL' || v.phase === 'LAND_ROLL') ? 'filter:url(#sim-glow-green)' : '';
+    return (v.state === 'INCURSION'
+        ? `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9" fill="#FF4444" fill-opacity="0.18" class="sim-inc-ring"/>`
+        : '')
+      + `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5.5" fill="${col}" style="${gf}" fill-opacity="0.95"/>`
+      + `<text x="${x.toFixed(1)}" y="${(y+3.2).toFixed(1)}" text-anchor="middle" `
+      + `font-family="'Share Tech Mono',monospace" font-size="6" fill="#000" font-weight="bold">${v.id}</text>`;
+  }).join('');
+  const el = document.getElementById('sim-track-count');
+  if (el) el.textContent = visible.length + ' 個目標追蹤中';
+}
+
+function simRenderTaxiways() {
+  const g = document.getElementById('sim-taxiway-layout');
+  if (!g) return;
+  const tw = state.taxiways;
+  const col = { OFF:'#2a2a2a', GUARDED:'#FFD700', AUTHORIZED:'#00FF88', INCURSION_LATCHED:'#FF4444', FAULT:'#AA66FF' };
+  const rwyOff2 = state.stm === 'ACTIVE' && state.rwy === 'OFF';
+  const offCol = rwyOff2 ? '#007744' : '#2a2a2a';
+
+  let html = '';
+  SIM_TX_X.forEach((x, i) => {
+    const nId = (i+1)+'N', sId = (i+1)+'S';
+    const nc = col[tw[nId]] || offCol;
+    const sc = col[tw[sId]] || offCol;
+    const lx = x - 11;
+
+    // North taxiway lane
+    html += `<rect x="${lx}" y="55" width="22" height="55" fill="#181818" stroke="${nc}" stroke-width="1.5"/>`;
+    html += `<text x="${x}" y="101" text-anchor="middle" font-family="'Share Tech Mono',monospace" font-size="8" fill="${nc}">${nId}</text>`;
+    // North junction dot — placed 4px inside taxiway (not on runway boundary) so it doesn't overlap runway stroke
+    html += `<circle cx="${x}" cy="106" r="4" fill="${nc}"/>`;
+
+    // South taxiway lane
+    html += `<rect x="${lx}" y="150" width="22" height="55" fill="#181818" stroke="${sc}" stroke-width="1.5"/>`;
+    html += `<text x="${x}" y="166" text-anchor="middle" font-family="'Share Tech Mono',monospace" font-size="8" fill="${sc}">${sId}</text>`;
+    // South junction dot — placed 4px inside taxiway (not on runway boundary)
+    html += `<circle cx="${x}" cy="154" r="4" fill="${sc}"/>`;
+  });
+  g.innerHTML = html;
+}
+
+function toggleSim() {
+  if (!simCfg.running) {
+    simCfg.running = true;
+    if (simCfg.vehicles.length === 0) simInitVehicles();
+    simCfg.lastTs = performance.now();
+    simCfg.animId = requestAnimationFrame(simFrame);
+    const btn = document.getElementById('sim-toggle-btn');
+    btn.textContent = '⏹ 停止';
+    btn.style.borderColor = '#FF4444';
+    btn.style.color = '#FF4444';
+    const dot = document.getElementById('sim-status-dot');
+    dot.style.background = '#00FF88';
+    dot.style.boxShadow = '0 0 6px #00FF8866';
+  } else {
+    simCfg.running = false;
+    if (simCfg.animId) { cancelAnimationFrame(simCfg.animId); simCfg.animId = null; }
+    const btn = document.getElementById('sim-toggle-btn');
+    btn.textContent = '▶ 啟動';
+    btn.style.borderColor = '';
+    btn.style.color = '';
+    const dot = document.getElementById('sim-status-dot');
+    dot.style.background = '#333';
+    dot.style.boxShadow = 'none';
+  }
+}
+
+function simSetSpeed(s) {
+  simCfg.speed = s;
+  ['slow','normal','fast'].forEach(n => {
+    const b = document.getElementById('sim-btn-' + n);
+    if (b) { b.style.borderColor = '#2a2a2a'; b.style.color = '#444'; }
+  });
+  const active = s === 0.5 ? 'slow' : s === 2 ? 'fast' : 'normal';
+  const b = document.getElementById('sim-btn-' + active);
+  if (b) { b.style.borderColor = '#FFD700'; b.style.color = '#FFD700'; }
+}
+
+function simReset() {
+  simCfg.vehicles = [];
+  simInitVehicles();
+  simRenderVehicles();
+  simRenderTaxiways();
+}
+
+// ─── Events table ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// MOCKUP DATA SOURCE — simEvents is populated by the simulation engine.
+//
+// To connect to real backend (remove this block entirely):
+//   1. DELETE: simEvents, simEventCounter, simAddIncursionEvent()
+//   2. REPLACE fetchEvents() → GET /api/events?page=1&pageSize=50 (EventService)
+//   3. REPLACE real-time append → socket.on('event:created', ev => {
+//        simEvents.unshift(adaptApiEvent(ev)); refreshEventsView();
+//      })
+//   4. DELETE simAddAuditEntry() and all its call-sites in clickStm / clickRwyOn /
+//      clickRwyOff / clickTaxiway — server writes audit via AuditService.log()
+// ══════════════════════════════════════════════════════════════════════════
+let simEvents = [];        // DELETE when connecting real API
+let simEventCounter = 0;   // DELETE when connecting real API
+
+// MOCKUP: Creates a mock incursion event from simulation data.
+// DELETE this entire function when connecting real backend.
+// In production, events are created server-side by the STM sensor pipeline
+// via POST /api/events → EventService.createEvent().
+function simAddIncursionEvent(twId, vehicleId, vehicleType) {
+  simEventCounter++;
+  const now  = new Date();
+  const date = now.toISOString().slice(0,10).replace(/-/g,'');
+  const id   = `SIM-${date}-${String(simEventCounter).padStart(4,'0')}`;
+  simEvents.unshift({
+    id,
+    time:     '剛才',
+    taxiway:  twId,
+    target:   vehicleType === 'VEHICLE' ? '車輛' : '飛機',
+    severity: 'RED',
+    status:   'NEW',
+    vlm:      'NOT_REQUESTED',
+  });
+  refreshEventsView();
+}
+
+function severityOrder(e) {
+  if (e.status === 'NEW' && e.severity === 'RED') return 0;
+  if (e.status === 'ACKNOWLEDGED' && e.severity === 'RED') return 1;
+  if (e.severity === 'YELLOW') return 2;
+  return 3;
+}
+
+function renderEventsTable(events) {
+  const tbody = document.getElementById('events-tbody');
+  if (!tbody) return;
+  const sorted = [...events].sort((a,b) => severityOrder(a) - severityOrder(b));
+  const severityBadge = { RED:'badge-red', YELLOW:'badge-yellow', INFO:'badge-blue' };
+  const statusBadge   = { NEW:'badge-blue', ACKNOWLEDGED:'badge-green', CLOSED:'badge-gray' };
+  const borderColor   = { RED:'#FF4444', YELLOW:'#FFD700', INFO:'#4499FF' };
+  const vlmLabel      = { COMPLETED:'<span class="text-[#00FF88]">&#10003; 完成</span>', NOT_REQUESTED:'<span class="text-[#555]">—</span>', PENDING:'<span class="text-[#4499FF]">...</span>' };
+
+  tbody.innerHTML = sorted.map(ev => `
+    <tr class="border-b border-[#1e1e1e] hover:bg-[#1a1a1a] cursor-pointer"
+        style="border-left:3px solid ${borderColor[ev.severity]||'#555'}"
+        onclick="showPage('event-detail')">
+      <td class="px-4 py-2.5 font-mono text-[#4499FF] text-xs">${ev.id}</td>
+      <td class="px-3 py-2.5 text-[#888] text-xs">${ev.time}</td>
+      <td class="px-3 py-2.5 font-mono text-xs ${ev.taxiway!=='—'?'text-[#e0e0e0]':'text-[#555]'}">${ev.taxiway}</td>
+      <td class="px-3 py-2.5 text-xs text-[#888]">${ev.target}</td>
+      <td class="px-3 py-2.5"><span class="badge ${severityBadge[ev.severity]||'badge-gray'}">${ev.severity}</span></td>
+      <td class="px-3 py-2.5"><span class="badge ${statusBadge[ev.status]||'badge-gray'} text-[9px]">${ev.status==='NEW'?'新增':ev.status==='ACKNOWLEDGED'?'確認':'關閉'}</span></td>
+      <td class="px-3 py-2.5 text-xs">${vlmLabel[ev.vlm]||'—'}</td>
+      <td class="px-3 py-2.5">
+        <div class="flex items-center gap-2">
+          <button onclick="event.stopPropagation();showPage('event-detail')" class="text-[#555] hover:text-[#4499FF] transition-colors" title="查看詳情">
+            <i data-lucide="eye" class="w-3.5 h-3.5"></i>
+          </button>
+          <button onclick="event.stopPropagation()" class="text-[#555] hover:text-[#888] transition-colors" title="時間軸">
+            <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
+          </button>
+          ${ev.vlm==='COMPLETED'?`<button onclick="event.stopPropagation()" class="text-[#555] hover:text-[#888] transition-colors" title="影像"><i data-lucide="camera" class="w-3.5 h-3.5"></i></button>`:''}
+        </div>
+      </td>
+    </tr>
+  `).join('');
+  lucide.createIcons();
+}
+
+// Refreshes badge count + re-renders table. Call after every simEvents mutation.
+// DELETE and replace with real-time socket handler when connecting backend.
+function refreshEventsView() {
+  const badge = document.getElementById('events-count-badge');
+  if (badge) badge.textContent = simEvents.length + ' 筆紀錄';
+  filterEvents(); // re-apply current filter
+}
+
+function filterEvents() {
+  const sev    = document.getElementById('filter-severity').value;
+  const status = document.getElementById('filter-status').value;
+  const loc    = document.getElementById('filter-loc').value;
+  const target = document.getElementById('filter-target').value;
+  const search = document.getElementById('filter-search').value.toLowerCase();
+  // MOCKUP: filters simEvents. DELETE and replace with API query params when connecting backend.
+  const filtered = simEvents.filter(e =>
+    (!sev    || e.severity === sev) &&
+    (!status || e.status === status) &&
+    (!loc    || e.taxiway === loc) &&
+    (!target || e.target === target) &&
+    (!search || e.id.toLowerCase().includes(search))
+  );
+  renderEventsTable(filtered);
+}
+
+function resetFilters() {
+  document.getElementById('filter-severity').value = '';
+  document.getElementById('filter-status').value   = '';
+  document.getElementById('filter-loc').value      = '';
+  document.getElementById('filter-target').value   = '';
+  document.getElementById('filter-search').value   = '';
+  renderEventsTable(simEvents); // MOCKUP: replace simEvents with real data source
+}
+
+// ─── Audit log ────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// MOCKUP: simAuditLog is populated by clickStm / clickRwyOn / clickRwyOff /
+// clickTaxiway / simStep (incursion).
+//
+// To connect to real backend (remove this block entirely):
+//   1. DELETE: simAuditLog, simAddAuditEntry(), renderAuditTable()
+//   2. REPLACE renderAuditTable() call in showPage → GET /api/audit-logs
+//      (AuditService.getLogs) and render server-returned rows
+//   3. DELETE all simAddAuditEntry() call-sites — server logs via AuditService.log()
+//      called inside route handlers / socket events
+// ══════════════════════════════════════════════════════════════════════════
+let simAuditLog = []; // DELETE when connecting real API
+
+// MOCKUP: Appends one row to the in-memory audit log and refreshes the table.
+// DELETE entire function when connecting real backend.
+function simAddAuditEntry(operator, action, target, prevState, newState, result) {
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('zh-TW', { hour12: false });
+  simAuditLog.unshift({ time: timeStr, operator, action, target, prevState, newState, result });
+  const badge = document.getElementById('audit-count-badge');
+  if (badge) badge.textContent = simAuditLog.length + ' 筆紀錄';
+  renderAuditTable();
+}
+
+// MOCKUP: Renders simAuditLog into #audit-tbody.
+// DELETE and replace with real API response renderer when connecting backend.
+function renderAuditTable() {
+  const tbody = document.getElementById('audit-tbody');
+  if (!tbody) return;
+  if (simAuditLog.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-[#444] font-panel text-[11px]">— 暫無紀錄，請啟動 STM 後操作 —</td></tr>';
+    return;
+  }
+  const aColor = {
+    INCURSION_DETECTED:      '#FF4444',
+    INCURSION_CLEARED:       '#4499FF',
+    STM_ACTIVATED:           '#00FF88',
+    STM_DEACTIVATED:         '#666',
+    RUNWAY_PROTECTION_ON:    '#FFD700',
+    RUNWAY_PROTECTION_OFF:   '#666',
+    TAXIWAY_AUTHORIZED:      '#00FF88',
+    TAXIWAY_GUARDED:         '#FFD700',
+    TAXIWAY_INCURSION_RESET: '#4499FF',
+  };
+  const rBadge = { ALARM:'badge-red', SUCCESS:'badge-green', BLOCKED:'badge-yellow', INFO:'badge-blue' };
+  tbody.innerHTML = simAuditLog.map(e => `
+    <tr class="border-b border-[#1e1e1e] hover:bg-[#1a1a1a]">
+      <td class="px-4 py-2.5 font-mono text-[#555]">${e.time}</td>
+      <td class="px-3 py-2.5 text-[#888]">${e.operator}</td>
+      <td class="px-3 py-2.5"><span class="font-mono" style="color:${aColor[e.action]||'#888'}">${e.action}</span></td>
+      <td class="px-3 py-2.5 font-mono text-[#888]">${e.target}</td>
+      <td class="px-3 py-2.5 font-mono text-[#555]">${e.prevState}</td>
+      <td class="px-3 py-2.5 font-mono" style="color:${aColor[e.action]||'#e0e0e0'}">${e.newState}</td>
+      <td class="px-3 py-2.5"><span class="badge ${rBadge[e.result]||'badge-gray'} text-[9px]">${e.result}</span></td>
+    </tr>`).join('');
+}
+
+// ─── Page routing ─────────────────────────────────────────────
+const allPages = ['monitor','events','event-detail','audit','system'];
+function showPage(page) {
+  allPages.forEach(p => {
+    document.getElementById('page-' + p).classList.add('hidden');
+    const nav = document.getElementById('nav-' + p);
+    if (nav) { nav.classList.remove('active'); nav.style.color = '#888'; }
+  });
+  document.getElementById('page-' + page).classList.remove('hidden');
+  const nav = document.getElementById('nav-' + page);
+  if (nav) { nav.classList.add('active'); nav.style.color = '#e0e0e0'; }
+  if (page === 'events') renderEventsTable(simEvents); // MOCKUP: replace simEvents with GET /api/events
+  if (page === 'audit') renderAuditTable();            // MOCKUP: replace renderAuditTable() with GET /api/audit-logs
+  if (page === 'system') {
+    document.getElementById('sys-updated').textContent = new Date().toLocaleTimeString('zh-TW', {hour12:false});
+    updateSystemTaxiways();
+  }
+  lucide.createIcons();
+}
+
+// ─── Clock ────────────────────────────────────────────────────
+let startEpoch = Date.now();
+function tickClock() {
+  const now = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  const ts = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  document.getElementById('clock').textContent = ts;
+
+  // Uptime from 08:00:00 today
+  const base = new Date(now); base.setHours(8,0,0,0);
+  const diff = Math.max(0, Math.floor((now - base) / 1000));
+  const h = Math.floor(diff/3600), m = Math.floor((diff%3600)/60), s = diff%60;
+  const ut = document.getElementById('sys-uptime');
+  if (ut) ut.textContent = `${pad(h)}:${pad(m)}:${pad(s)}`;
+  if (document.getElementById('sys-updated')) {
+    // only update if visible
+  }
+}
+setInterval(tickClock, 1000);
+tickClock();
+
+// ─── Init ─────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  lucide.createIcons();
+  updatePanel();
+  simInitVehicles();
+  simRenderTaxiways();
+  renderEventsTable(simEvents); // MOCKUP: replace with GET /api/events on init
+  showPage('monitor');
+});
+// Also call after load in case DOMContentLoaded already fired
+lucide.createIcons();
+</script>
+</body>
+</html>
