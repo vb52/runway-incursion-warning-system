@@ -7,6 +7,7 @@ import {
   ClipboardList,
   Settings,
   Crosshair,
+  Frame,
   Wifi,
   WifiOff,
 } from 'lucide-react';
@@ -53,7 +54,9 @@ interface NavGroup {
 //      server/ 底下那一套狀態機）自己的管理頁面：事件中心、操作紀錄、系統
 //      狀態。這些頁面完全不碰偵測器設定。
 //   3. 偵測器後台管理 — RIWS-POC（Python YOLO 偵測器，獨立 repo）的管理頁
-//      面。目前只有 Zone/Mask 編輯器（DetectorConfig.tsx），資料存在
+//      面。有偵測器設定（DetectorConfig.tsx，AI/動態/手動三重偵測開關、示範
+//      影片）跟偵測區域設定（ZoneConfig.tsx，Z1/Z2/Z3 等動態偵測區域的框選/
+//      編輯，從 DetectorConfig.tsx 拆出來的獨立頁面）。資料都存在
 //      detector_config 表（server/src/services/DetectorConfigService.ts），
 //      透過 RIWS-POC/src/riws_bridge.py 跟桌面版 Python 程式互相同步。
 const navGroups: NavGroup[] = [
@@ -75,6 +78,7 @@ const navGroups: NavGroup[] = [
     title: '偵測器後台管理',
     items: [
       { to: '/detector', icon: Crosshair, label: '偵測器設定', sublabel: 'Detector Config' },
+      { to: '/detector/zones', icon: Frame, label: '偵測區域設定', sublabel: 'Zone Config' },
     ],
   },
 ];
@@ -116,6 +120,7 @@ export function Layout() {
                   <NavLink
                     key={to}
                     to={to}
+                    end
                     className={({ isActive }) =>
                       `flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-sm ${
                         isActive
@@ -183,13 +188,32 @@ export function Layout() {
         </header>
 
         {/* Page Content */}
-        <main className="flex-1 overflow-auto">
-          {/* Always mounted, CSS-toggled — see the comment on isMonitor/
-              isDetector above for why. */}
-          <div className="h-full" style={{ display: isMonitor ? 'block' : 'none' }}>
+        <main className="flex-1 overflow-auto relative">
+          {/* Always mounted, toggled via `visibility` (not `display`) — see
+              the comment on isMonitor/isDetector above for why they stay
+              mounted at all. `display:none` was the first cut, but CSS
+              `animation`/`transition` (the RWY/incursion pulseRed pulse,
+              flashYellow, the camera panel's enlarge transition) resets to
+              frame zero when an element goes from display:none back to
+              block, even though the underlying state never changed — so
+              switching back to a page mid-incursion made the pulse replay
+              from scratch and looked like a brand-new alert had just fired.
+              `visibility:hidden` keeps animations/transitions running while
+              hidden, so the state is already mid-animation (matching
+              reality) the moment it's switched back to visible. Absolutely
+              positioned so the hidden one doesn't reserve layout space
+              (visibility, unlike display, keeps the box in flow) and
+              pointer-events:none so the invisible page can't eat clicks.  */}
+          <div
+            className="absolute inset-0 h-full"
+            style={{ visibility: isMonitor ? 'visible' : 'hidden', pointerEvents: isMonitor ? 'auto' : 'none' }}
+          >
             <LiveMonitor />
           </div>
-          <div className="h-full overflow-auto" style={{ display: isDetector ? 'block' : 'none' }}>
+          <div
+            className="absolute inset-0 h-full overflow-auto"
+            style={{ visibility: isDetector ? 'visible' : 'hidden', pointerEvents: isDetector ? 'auto' : 'none' }}
+          >
             <DetectorConfigPage />
           </div>
           {/* Every other page still uses normal route-driven mount/unmount. */}

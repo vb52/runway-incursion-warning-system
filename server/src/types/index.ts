@@ -270,6 +270,25 @@ export interface DetectorConfig {
   // Empty array = no motion zones configured (motion detection has nothing
   // to scan).
   motion_zones: DetectorMotionZone[];
+  // Fraction-of-pixels-changed (0-1) that counts as "something moved" in a
+  // motion zone — shared across every zone, not per-zone. Persisted here
+  // (rather than staying local React state on DetectorConfig.tsx) so
+  // ZoneConfig.tsx can also show/edit it while calibrating zones, without
+  // needing a second live copy of the value.
+  motion_threshold: number;
+  // Runway boundary trigger — a single region (same rect shape as a motion
+  // zone, drawn/edited on ZoneConfig.tsx) representing where an aircraft
+  // physically crosses onto the runway. Deliberately separate from
+  // motion_zones: those feed the Z1/Z2/Z3 ground-sim projection
+  // (AirportSimPanel), this one feeds real incursion evidence — crossing it
+  // reports a detection the same way any zone does (POST /api/demo/detect,
+  // which already checks the taxiway's real authorization state server-side
+  // and only latches INCURSION_LATCHED if it wasn't authorized — no separate
+  // "is this authorized" logic needed here), but also asks the caller to
+  // attach a real snapshot of the video frame at that moment (see
+  // DetectionResult.snapshot_base64) instead of relying on the generated
+  // placeholder image. null = not configured, nothing scanned.
+  incursion_line: DetectorMotionZone | null;
   updated_at: string;
 }
 
@@ -277,4 +296,12 @@ export interface DetectorMotionZone {
   id: string; // e.g. 'Z1', 'Z2' — display label, also the frame-diff baseline's cache key
   rect: DetectorRect;
   taxiway_id: string;
+  // Per-zone override for DetectorConfig.motion_threshold (0-1, same
+  // fraction-of-pixels-changed scale). undefined/omitted = use the shared
+  // default. Exists because a shared threshold calibrated for one zone can
+  // leave a DIFFERENT zone (e.g. one sitting over a busier part of the
+  // frame) firing on background noise — Z2+Z3 both firing together means
+  // "takeoff" (see AirportSimPanel.spawnAtTaxiway), so a noisy Z3 alone was
+  // enough to make planes appear to take off the instant they entered.
+  threshold?: number;
 }

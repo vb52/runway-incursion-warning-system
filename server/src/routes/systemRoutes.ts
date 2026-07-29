@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { systemStateService } from '../services/SystemStateService';
 import { auditService } from '../services/AuditService';
+import { detectorAlertService } from '../services/DetectorAlertService';
 
 const router = Router();
 
@@ -30,6 +31,17 @@ router.post('/start', (req: Request, res: Response) => {
   if (!result.success) {
     return res.status(400).json({ success: false, error: result.error });
   }
+
+  // The video-driven AI/motion detection loops (client/src/pages/
+  // DetectorConfig.tsx) run continuously in the background regardless of STM
+  // power state, re-evaluating the current frame every tick. Without this,
+  // the very first tick after STM reaches ACTIVE would find whatever's
+  // currently in a motion zone and immediately call arm() — enabling RWY
+  // protection within a second of the operator pressing "啟動系統", before
+  // they've had a chance to see the system come up clean. Same grace-window
+  // mechanism RESET uses (see DetectorAlertService.suppress()).
+  detectorAlertService.suppress();
+
   res.json({ success: true, message: 'System starting...' });
 });
 

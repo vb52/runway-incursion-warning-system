@@ -6,6 +6,7 @@ import { Volume2, VolumeX, RotateCcw, ShieldOff } from 'lucide-react';
 import { AirportSimPanel, AirportSimPanelHandle } from '../components/AirportSimPanel';
 import { VideoFeed } from '../components/VideoFeed';
 import { useDetectorAlert } from '../hooks/useDetectorAlert';
+import { getSocket } from '../services/socketService';
 
 // ── Colour helpers ─────────────────────────────────────────────────────────────
 
@@ -325,6 +326,35 @@ export function LiveMonitor() {
   // AirportSimPanel's own refs and isn't reachable any other way — see
   // AirportSimPanelHandle.
   const simPanelRef = useRef<AirportSimPanelHandle>(null);
+
+  // DetectorConfig.tsx's motion tick loop reports an already-CONFIRMED
+  // runway event ("plane at taxiway X is now doing Y" — see that file's
+  // determineRunwayEvent + consecutive-tick confirmation) via this socket
+  // event — spawn/advance a matching vehicle in the ground-sim diagram so
+  // the real video detection is visibly tied to a specific spot in the
+  // simulation instead of the two staying disconnected. Works regardless of
+  // which page is currently visible, same as the detection loops themselves
+  // (see Layout.tsx's always-mounted LiveMonitor/DetectorConfigPage).
+  useEffect(() => {
+    const socket = getSocket();
+    const onSpawn = (data: { taxiway_id: string; event: 'TAKEOFF' | 'RUNWAY_HOLDING' | 'ENTERING' }) => {
+      simPanelRef.current?.spawnAt(data.taxiway_id, data.event);
+    };
+    socket.on('sim:spawn-at-taxiway', onSpawn);
+    return () => { socket.off('sim:spawn-at-taxiway', onSpawn); };
+  }, []);
+
+  // The source video jumped to a different time (see DetectorConfig.tsx's
+  // handleVideoSeeking) — every taxiway's old Z1/Z2/Z3 state is now
+  // meaningless, so drop any LIVE-tracked vehicle instead of leaving it
+  // frozen mid-animation at a position that no longer corresponds to
+  // anything. DEMO vehicles are untouched (see clearLiveVehicles).
+  useEffect(() => {
+    const socket = getSocket();
+    const onSeeking = () => simPanelRef.current?.clearLive();
+    socket.on('detector:video-seeking', onSeeking);
+    return () => { socket.off('detector:video-seeking', onSeeking); };
+  }, []);
 
   const handleFullReset = async () => {
     if (!window.confirm('確定要清空重置整個場景嗎？這會停止系統、清除所有事件，並重設地面模擬。')) return;

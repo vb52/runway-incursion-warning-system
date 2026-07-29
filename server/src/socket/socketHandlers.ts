@@ -58,9 +58,36 @@ export function setupSocketHandlers(io: SocketIOServer): void {
     // instead of the two staying visually disconnected. Pure relay, no
     // server-side state — momentary visual event, nothing to replay to a
     // late-joining client.
-    socket.on('sim:spawn-at-taxiway', (payload: { taxiway_id?: string }) => {
+    socket.on('sim:spawn-at-taxiway', (payload: { taxiway_id?: string; event?: string }) => {
       if (typeof payload?.taxiway_id !== 'string') return;
-      io.emit('sim:spawn-at-taxiway', { taxiway_id: payload.taxiway_id });
+      // Respect the same grace window as arm() (see DetectorAlertService.
+      // isSuppressed/suppress) — right after an operator RESET or manual
+      // system start, a detector-triggered spawn would otherwise call
+      // AirportSimPanel.spawnAtTaxiway(), which auto-starts the ground-sim
+      // loop the instant it arrives, undoing the "clean" reset the operator
+      // just asked for just as surely as an immediate RWY re-arm would.
+      if (detectorAlertService.isSuppressed()) return;
+      // event is either DetectorConfig.tsx's already-CONFIRMED runway event
+      // (TAKEOFF/RUNWAY_HOLDING — determineRunwayEvent + consecutive-tick
+      // confirmation, see that file's 事件判定 section: a one-time transition,
+      // not something to re-derive or re-interpret here) or ENTERING, a
+      // separate lighter-weight unconfirmed "a plane showed up" ping (Z1
+      // alone) that exists purely so the ground-sim panel has something to
+      // show before RUNWAY_HOLDING's Z1+Z2-same-tick requirement can fire.
+      if (payload.event !== 'TAKEOFF' && payload.event !== 'RUNWAY_HOLDING' && payload.event !== 'ENTERING') return;
+      io.emit('sim:spawn-at-taxiway', { taxiway_id: payload.taxiway_id, event: payload.event });
+    });
+
+    // DetectorConfig.tsx's source video jumped to a different time (seek bar
+    // drag, click-to-seek, or a programmatic currentTime change from any
+    // page — see that file's handleVideoSeeking). Every taxiway's Z1/Z2/Z3
+    // state at the OLD time point is now meaningless, so tell AirportSimPanel
+    // to drop any LIVE-tracked vehicle (and whatever animation it was mid-
+    // playing) rather than let it keep going as if nothing happened. Pure
+    // relay, no server-side state — same momentary-event shape as
+    // sim:spawn-at-taxiway above.
+    socket.on('detector:video-seeking', () => {
+      io.emit('detector:video-seeking');
     });
 
     // DEBUG: Ping/pong for connection testing

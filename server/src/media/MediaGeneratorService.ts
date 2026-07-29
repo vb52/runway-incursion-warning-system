@@ -208,7 +208,13 @@ export interface GeneratedMediaRecord {
 }
 
 class MediaGeneratorService {
-  generateEventMedia(event: RiwsEvent): GeneratedMediaRecord[] {
+  // skipDetectionImage: true when a real camera snapshot is being attached
+  // instead (see saveDetectionSnapshot) — otherwise the event would end up
+  // with both a real detection.jpg AND a placeholder detection.svg both
+  // tagged DETECTION_IMAGE, showing two conflicting "detection" images.
+  // PRE/POST_EVENT_IMAGE are still generated either way — there's no real
+  // "before/after" frame to substitute those with.
+  generateEventMedia(event: RiwsEvent, options?: { skipDetectionImage?: boolean }): GeneratedMediaRecord[] {
     const storageBase = getAbsoluteStorageBase();
     const eventDir = path.join(storageBase, event.event_code);
     ensureDir(eventDir);
@@ -247,32 +253,35 @@ class MediaGeneratorService {
       capturedAt: preTime,
     });
 
-    // DETECTION: Target detected with bounding box
+    // DETECTION: Target detected with bounding box (skipped when a real
+    // camera snapshot is being attached instead — see saveDetectionSnapshot)
     const detectTime = event.detected_at;
     const isIncursion = event.event_type === 'RUNWAY_INCURSION';
-    const detectSvg = generateSvgContent({
-      title: 'DETECTION IMAGE',
-      cameraId,
-      datetime: formatDisplay(detectTime),
-      taxiwayId,
-      targetId,
-      targetType,
-      confidence,
-      showBoundingBox: true,
-      incursionStatus: isIncursion ? '⚠ RUNWAY INCURSION DETECTED ⚠' : '⚠ UNAUTHORIZED APPROACH',
-      isIncursion,
-      frameColor: isIncursion ? '#ff3333' : '#ffaa00',
-      frameLabel: isIncursion ? '▶ DETECTION | INCURSION' : '▶ DETECTION | ALERT',
-    });
-    const detectFileName = 'detection.svg';
-    const detectFilePath = path.join(eventDir, detectFileName);
-    fs.writeFileSync(detectFilePath, detectSvg, 'utf-8');
-    records.push({
-      mediaType: 'DETECTION_IMAGE',
-      fileName: detectFileName,
-      filePath: `${event.event_code}/${detectFileName}`,
-      capturedAt: detectTime,
-    });
+    if (!options?.skipDetectionImage) {
+      const detectSvg = generateSvgContent({
+        title: 'DETECTION IMAGE',
+        cameraId,
+        datetime: formatDisplay(detectTime),
+        taxiwayId,
+        targetId,
+        targetType,
+        confidence,
+        showBoundingBox: true,
+        incursionStatus: isIncursion ? '⚠ RUNWAY INCURSION DETECTED ⚠' : '⚠ UNAUTHORIZED APPROACH',
+        isIncursion,
+        frameColor: isIncursion ? '#ff3333' : '#ffaa00',
+        frameLabel: isIncursion ? '▶ DETECTION | INCURSION' : '▶ DETECTION | ALERT',
+      });
+      const detectFileName = 'detection.svg';
+      const detectFilePath = path.join(eventDir, detectFileName);
+      fs.writeFileSync(detectFilePath, detectSvg, 'utf-8');
+      records.push({
+        mediaType: 'DETECTION_IMAGE',
+        fileName: detectFileName,
+        filePath: `${event.event_code}/${detectFileName}`,
+        capturedAt: detectTime,
+      });
+    }
 
     // POST-EVENT: After event, area clear
     const postTime = new Date(now + 60000).toISOString();
@@ -300,8 +309,36 @@ class MediaGeneratorService {
       capturedAt: postTime,
     });
 
-    logger.info(`[MEDIA] Generated 3 SVG files for event ${event.event_code} in ${eventDir}`);
+    logger.info(`[MEDIA] Generated ${records.length} SVG file(s) for event ${event.event_code} in ${eventDir}`);
     return records;
+  }
+
+  // Writes a REAL camera frame (base64-encoded JPEG, captured client-side
+  // from the detector's <video> when crossing config.incursion_line — see
+  // DetectorConfig.tsx) to disk as this event's detection image, instead of
+  // the generated placeholder. Paired with generateEventMedia's
+  // skipDetectionImage option so the two never both claim DETECTION_IMAGE.
+  saveDetectionSnapshot(event: RiwsEvent, base64Jpeg: string): GeneratedMediaRecord {
+    const storageBase = getAbsoluteStorageBase();
+    const eventDir = path.join(storageBase, event.event_code);
+    ensureDir(eventDir);
+
+    // Tolerate both a raw base64 string and a "data:image/jpeg;base64,...." URI.
+    const commaIdx = base64Jpeg.indexOf(',');
+    const raw = base64Jpeg.startsWith('data:') && commaIdx !== -1 ? base64Jpeg.slice(commaIdx + 1) : base64Jpeg;
+    const buffer = Buffer.from(raw, 'base64');
+
+    const fileName = 'detection.jpg';
+    const filePath = path.join(eventDir, fileName);
+    fs.writeFileSync(filePath, buffer);
+    logger.info(`[MEDIA] Saved real detection snapshot for event ${event.event_code} (${buffer.length} bytes)`);
+
+    return {
+      mediaType: 'DETECTION_IMAGE',
+      fileName,
+      filePath: `${event.event_code}/${fileName}`,
+      capturedAt: event.detected_at,
+    };
   }
 
   getMediaPath(relativePath: string): string {

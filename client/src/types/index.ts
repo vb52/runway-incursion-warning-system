@@ -191,8 +191,24 @@ export interface DetectorConfig {
   // another each report to the right taxiway instead of everything funneling
   // through one shared video_trigger_taxiway_id. Empty array = no motion
   // zones configured (motion detection has nothing to scan). See
-  // DetectorConfig.tsx's zone drawing UI.
+  // ZoneConfig.tsx's zone drawing UI.
   motion_zones: DetectorMotionZone[];
+  // Fraction-of-pixels-changed (0-1) that counts as "something moved" in a
+  // motion zone — shared across every zone, not per-zone. Persisted (rather
+  // than local React state) so both DetectorConfig.tsx (live tuning, next
+  // to the real-time score meter) and ZoneConfig.tsx (while calibrating
+  // zones) can show/edit the same value.
+  motion_threshold: number;
+  // Runway boundary trigger — a single region (drawn/edited on
+  // ZoneConfig.tsx, same rect shape as a motion zone) representing where an
+  // aircraft physically crosses onto the runway. Separate from motion_zones
+  // — those feed the Z1/Z2/Z3 ground-sim projection, this one feeds real
+  // incursion evidence: crossing it reports a detection the same way any
+  // zone does (the backend already checks real authorization state and only
+  // latches INCURSION_LATCHED if unauthorized), plus attaches a real video
+  // frame snapshot to the resulting event instead of a placeholder image.
+  // null = not configured, nothing scanned.
+  incursion_line: DetectorMotionZone | null;
   updated_at: string;
 }
 
@@ -200,4 +216,8 @@ export interface DetectorMotionZone {
   id: string; // e.g. 'Z1', 'Z2' — display label, also the frame-diff baseline's cache key
   rect: DetectorRect;
   taxiway_id: string;
+  // Per-zone override for DetectorConfig.motion_threshold (0-1, same
+  // fraction-of-pixels-changed scale). undefined = use the shared default.
+  // See ZoneConfig.tsx's per-zone threshold control.
+  threshold?: number;
 }

@@ -7,6 +7,7 @@ import { EventCenter } from './pages/EventCenter';
 import { EventDetail } from './pages/EventDetail';
 import { AuditLogPage } from './pages/AuditLog';
 import { SystemStatus } from './pages/SystemStatus';
+import { ZoneConfigPage } from './pages/ZoneConfig';
 import { SocketInitializer } from './components/SocketInitializer';
 import './index.css';
 
@@ -30,6 +31,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
             <Route path="audit" element={<AuditLogPage />} />
             <Route path="system" element={<SystemStatus />} />
             <Route path="detector" element={null} />
+            <Route path="detector/zones" element={<ZoneConfigPage />} />
           </Route>
         </Routes>
       </BrowserRouter>

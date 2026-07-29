@@ -593,7 +593,11 @@ export function EventDetail() {
             {media.map((m) => (
               <div key={m.id} className="bg-gray-800/50 rounded-lg overflow-hidden border border-gray-700">
                 <div className="aspect-video bg-gray-950 flex items-center justify-center overflow-hidden">
-                  {m.file_path.endsWith('.svg') ? (
+                  {/* .svg = generated placeholder; .jpg/.jpeg/.png = a real
+                      camera snapshot (see DetectorConfig.tsx's incursion-line
+                      scanning / SimulationEngine.processDetection's
+                      snapshotBase64) — both render the same way. */}
+                  {/\.(svg|jpe?g|png)$/i.test(m.file_path) ? (
                     <img
                       src={`/api/media/events/${m.file_path}`}
                       alt={m.file_name}

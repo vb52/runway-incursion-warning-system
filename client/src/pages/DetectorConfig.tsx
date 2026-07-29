@@ -18,15 +18,19 @@
 //      會列出模型每個 tick 實際看到的所有類別跟分數，方便判斷是完全沒測到還是
 //      誤判成別的東西。
 //   2. 動態偵測（Motion）：簡單的逐幀差異比對，裁切到操作員畫出的一或多個
-//      「偵測區域」（config.motion_zones——按「新增偵測區域」拖曳畫出，跟舊的
-//      Zone 編輯器一樣的拖曳互動；每個區域各自獨立比對、各自對應自己的
-//      taxiway_id，例如 Z1 框住某個聯絡道口、Z2 框住另一個，各自觸發各自的
-//      滑行道，不像 AI/手動標記共用同一個「觸發聯絡道」下拉選單），再縮小到
-//      MOTION_SAMPLE_W x MOTION_SAMPLE_H 比對像素差異量，概念上對應 RIWS-POC
-//      桌面版用 cv2.createBackgroundSubtractorMOG2() 補捉 YOLO 漏掉的角度。
-//      不特別分辨「是不是飛機」，區域內任何明顯移動都算，所以框選範圍很重要——
-//      沒有設定任何區域就完全不會掃描（不會退回掃整個畫面），框住跑道/聯絡道口
-//      才準確。有獨立開關可以整個關掉。
+//      「偵測區域」（config.motion_zones，Z1/Z2/Z3...；框選/編輯在獨立的
+//      ZoneConfig.tsx「偵測區域設定」頁，這頁只讀不編輯，見下方唯讀疊圖）；
+//      每個區域各自獨立比對、各自對應自己的 taxiway_id，例如 Z1 框住某個聯絡
+//      道口、Z2 框住另一個，各自觸發各自的滑行道，不像 AI/手動標記共用同一個
+//      「觸發聯絡道」下拉選單，再縮小到 MOTION_SAMPLE_W x MOTION_SAMPLE_H 比對
+//      像素差異量，概念上對應 RIWS-POC 桌面版用
+//      cv2.createBackgroundSubtractorMOG2() 補捉 YOLO 漏掉的角度。不特別分辨
+//      「是不是飛機」，區域內任何明顯移動都算，所以框選範圍很重要——沒有設定
+//      任何區域就完全不會掃描（不會退回掃整個畫面），框住跑道/聯絡道口才準確。
+//      有獨立開關可以整個關掉。掃描迴圈留在這頁（而不是搬去 ZoneConfig.tsx）
+//      是因為這頁的 <video> 元素必須不管在不在畫面上都持續在背景播放/解碼
+//      （見 Layout.tsx 的 always-mounted 說明）——ZoneConfig.tsx 是普通路由頁
+//      面，切走就會卸載，沒辦法拿來跑背景偵測。
 //   3. 操作員手動標記：影片播放到飛機出現的畫面時按「標記目前畫面有飛機」，
 //      記錄當下秒數（video_trigger_seconds，存在 config 裡，兩個自動偵測都
 //      測不到時的保底手段）。之後每次循環播放到那個時間點（±TRIGGER_
@@ -43,21 +47,28 @@
 // server/src/services/VideoSyncService.ts）跟「主戰情表」頁面
 // （client/src/components/VideoFeed.tsx）同步——在任一頁調整速度或拖曳進度條，
 // 兩邊都會跟著動。偵測/觸發邏輯只在這一頁跑，避免兩個頁面同時開著時觸發兩次。
-// 兩邊完全不受 RESET（LiveMonitor.tsx handleFullReset）影響：RESET 只重置後端
-// 系統狀態/事件跟 AirportSimPanel 的模擬車隊，從沒碰過 <video> 元素本身。
+// <video> 元素本身、播放位置/速度不受 RESET（LiveMonitor.tsx handleFullReset）
+// 影響——RESET 從沒碰過它。但 RESET 現在會呼叫 detectorAlertService.clear()
+// 立即結束目前的警戒倒數，並短暫（MANUAL_CLEAR_SUPPRESS_MS，見
+// DetectorAlertService.ts）忽略新的 arm() 請求，因為 AI/Motion 偵測迴圈不管
+// 在哪一頁都持續在背景跑，若沒有這個緩衝，RESET 當下畫面上如果還看得到飛機，
+// 下一個 tick 就會立刻重新警戒，操作員永遠看不到「乾淨」的重置結果。
 //
 // 跑道警戒倒數（armRunwayAlert）也是伺服器端狀態（server/src/services/
 // DetectorAlertService.ts），不是這頁自己算自己的 setTimeout——這樣「主戰情表」
 // 才能顯示同一個倒數，而不是只有觸發偵測的那個分頁看得到。
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Crosshair, Save, RefreshCw, Play, Loader2, Plane, Trash2, RotateCcw } from 'lucide-react';
+import { Link, useLocation } from 'react-router-dom';
+import { Crosshair, Save, RefreshCw, Play, Loader2, Plane, Trash2, RotateCcw, Frame, AlertTriangle } from 'lucide-react';
 import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
 import { detectorApi, demoApi } from '../services/api';
-import { DetectorConfig, DetectorMotionZone, DetectorRect, ALL_TAXIWAY_IDS } from '../types';
+import { DetectorConfig, DetectorMotionZone, ALL_TAXIWAY_IDS } from '../types';
 import { useVideoSync } from '../hooks/useVideoSync';
 import { useDetectorAlert } from '../hooks/useDetectorAlert';
+import { getSocket } from '../services/socketService';
+import { setDetectorVideoElement } from '../services/detectorVideoRegistry';
 
 const DETECT_INTERVAL_MS = 500;
 // Lowered from 0.5 — COCO-SSD is a general-purpose model, not trained on
@@ -75,13 +86,13 @@ const TRIGGER_COOLDOWN_MS = 20000;
 const RUNWAY_ALERT_DURATION_MS = 30000;
 // Motion detection: downscaled frame-diff sample size (perf). The
 // fraction-of-pixels-changed threshold that counts as "something moved" is
-// adjustable at runtime (see motionThreshold state below) — it was a fixed
-// 0.02 originally and turned out to fire too easily (compression noise/small
+// adjustable at runtime (config.motion_threshold, persisted — see
+// ZoneConfig.tsx, which also shows/edits it) — it was a fixed 0.02
+// originally and turned out to fire too easily (compression noise/small
 // background movement), so it's a live slider now instead of another guess
 // at a magic number.
 const MOTION_SAMPLE_W = 160;
 const MOTION_SAMPLE_H = 90;
-const DEFAULT_MOTION_THRESHOLD = 0.06;
 // Manual marks: timeupdate fires a few times a second, not every frame — a
 // small window around each marked second so a mark isn't missed.
 const TRIGGER_TOLERANCE_S = 0.35;
@@ -95,32 +106,132 @@ function formatTime(s: number): string {
   return `${m}:${sec.toString().padStart(2, '0')}`;
 }
 
-function normalizeRect(x1: number, y1: number, x2: number, y2: number): DetectorRect {
-  return {
-    x1: Math.round(Math.min(x1, x2)),
-    y1: Math.round(Math.min(y1, y2)),
-    x2: Math.round(Math.max(x1, x2)),
-    y2: Math.round(Math.max(y1, y2)),
-  };
-}
-
-// Cycled by index so each zone's overlay rect/label is visually distinct.
+// Cycled by index so each zone's overlay rect/label is visually distinct —
+// must match ZoneConfig.tsx's own ZONE_COLORS so a zone looks the same color
+// on both pages.
 const ZONE_COLORS = ['#00c8ff', '#ff9f1c', '#c792ea', '#00ff88', '#ff6b6b', '#ffd93d'];
 
-// First 'Z<n>' not already in use — stable even after zones in the middle
-// of the list are deleted.
-function nextZoneId(zones: DetectorMotionZone[]): string {
-  const used = new Set(zones.map((z) => z.id));
-  let n = 1;
-  while (used.has(`Z${n}`)) n++;
-  return `Z${n}`;
+// Z1/Z2/Z3 carry fixed operational meaning (operator-assigned convention,
+// not derived from anything) — the same飛機一次通過的三個階段：Z1 進入聯絡道
+// -> Z2 在跑道頭等待 -> Z3 起飛. determineRunwayEvent below keys off these
+// exact zone ids (matched by object identity per taxiway, see the tick loop)
+// to judge ONE event per taxiway per tick, which AirportSimPanel.
+// spawnAtTaxiway then just plays back — see that function's comment. Zones
+// beyond Z1-3 have no defined phase. Duplicated in ZoneConfig.tsx (that page
+// owns editing; this page only needs it for the read-only overlay/summary
+// below) rather than sharing a module — small enough that a shared import
+// isn't worth the indirection.
+const ZONE_PHASE_LABELS: Record<string, string> = {
+  Z1: '進入聯絡道',
+  Z2: '跑道頭等待',
+  Z3: '起飛',
+};
+
+// ── 跑道事件判定（先判定事件，再播放對應動畫）───────────────────────────────
+// Single source of truth for "what's happening on this taxiway right now",
+// shared by the "AI 判讀現況" text below and the ground-sim spawn emitted
+// from the motion tick loop. Deliberately NOT derived inside a per-zone
+// callback (onZ1Detected/onZ2Detected/... style) — every zone's hit state
+// for the SAME tick must be collected first (see the tick loop's zoneSnapshot
+// construction), then this pure function picks exactly one event from that
+// complete snapshot. That's what stops "Z2 fires -> play entering animation
+// -> Z3 fires a moment later -> switch to takeoff" — the animation-worthy
+// event is decided once, from a full snapshot, never from Z2 alone.
+//
+// Z1 alone is intentionally NOT its own event (no ENTERING/進入聯絡道 case) —
+// only TAKEOFF, RUNWAY_HOLDING and RUNWAY_HOLDING_PENDING are defined
+// events; anything else, including Z1 by itself, is NONE.
+//
+// RUNWAY_HOLDING_PENDING exists because "Z1+Z2 fired together" (the LATCH,
+// see runwayHoldingLatchedRef below) and "Z2 currently shows real, sustained
+// motion" (z2Motion) are deliberately two different bars: the latch fires
+// once, permanently, the instant Z1+Z2 first co-occur — that's what keeps
+// the waiting icon showing even through normal zone flicker afterward — but
+// the WAITING ANIMATION specifically must not start playing off that same
+// single co-occurring tick; it waits for Z2's own confirmed motion, same as
+// TAKEOFF waits for z3Triggered rather than a raw single-tick Z3 hit.
+// PENDING is "icon-worthy, not yet animation-worthy"; RUNWAY_HOLDING is both.
+type RunwayEvent = 'TAKEOFF' | 'RUNWAY_HOLDING' | 'RUNWAY_HOLDING_PENDING' | 'NONE';
+
+const RUNWAY_EVENT_LABELS: Record<Exclude<RunwayEvent, 'NONE'>, string> = {
+  TAKEOFF: '起飛',
+  RUNWAY_HOLDING: '跑道頭等待',
+  // Same label as RUNWAY_HOLDING on purpose — to an operator reading this
+  // text, the plane genuinely IS heading to/waiting at the threshold in
+  // both cases; PENDING vs confirmed only matters for whether the ground-sim
+  // animation is allowed to play, which the debug panel below shows
+  // separately (confirmedEvent / z2Motion).
+  RUNWAY_HOLDING_PENDING: '跑道頭等待',
+};
+
+// z3Triggered is NOT the same as z3 (this tick's raw threshold hit, exposed
+// separately below only as debug/informational — e.g. motionLevel — never as
+// a takeoff gate on its own). z3Triggered is whether Z3 has hit for
+// EVENT_CONFIRM_TICKS consecutive ticks in a row (see the tick loop's
+// z3StreakRef) — a single noisy frame crossing threshold must never be
+// enough to call TAKEOFF on its own; only sustained, confirmed motion earns
+// "triggered". validTakeoff below checks z3Triggered ALONE — deliberately
+// not `z3 && z3Triggered`, since z3StreakRef already resets to 0 (making
+// z3Triggered false) the instant a tick misses, so z3Triggered can never be
+// true without z3 also being true that same tick; anything else would be a
+// redundant, misleading condition.
+//
+// runwayHoldingLatched/z2Motion are both caller-maintained (tick loop), not
+// derived here — this stays a pure function of whatever snapshot it's given,
+// same as before; the STATEFULNESS (the latch persisting across ticks, the
+// z2 streak) lives entirely in the tick loop's refs, exactly like
+// z3StreakRef already does for z3Triggered.
+interface RunwayZoneSnapshot {
+  z1: boolean;
+  z2: boolean;
+  z3: boolean;
+  z3Triggered: boolean;
+  runwayHoldingLatched: boolean;
+  z2Motion: boolean;
 }
+
+function determineRunwayEvent(z: RunwayZoneSnapshot): RunwayEvent {
+  const validTakeoff = z.z3Triggered === true;
+  const validRunwayHolding = z.runwayHoldingLatched === true && z.z2Motion === true;
+  // Priority is fixed: TAKEOFF > RUNWAY_HOLDING > RUNWAY_HOLDING_PENDING >
+  // NONE. Z3.triggered wins even if the runway-holding latch and Z2 motion
+  // are also both true this tick — takeoff is never downgraded to a
+  // lower-priority event just because the plane was also seen waiting.
+  if (validTakeoff) return 'TAKEOFF';
+  if (validRunwayHolding) return 'RUNWAY_HOLDING';
+  if (z.runwayHoldingLatched) return 'RUNWAY_HOLDING_PENDING';
+  return 'NONE';
+}
+
+// How many consecutive detection ticks (DETECT_INTERVAL_MS apart) a signal
+// must hold before it's trusted — applied twice below: once to Z3 alone
+// (turns a raw hit into "confirmed motion"), once to the final determined
+// event itself (so a flip-flopping zone combo can't restart/switch the
+// ground-sim animation every single tick either). 3 ticks @ 500ms = 1.5s.
+const EVENT_CONFIRM_TICKS = 3;
+// Z2.motion's bar over Z2.triggered's own threshold — see the tick loop's
+// z2Motion comment for why this needs to be a stronger-score check rather
+// than a streak like z3Triggered. 1.5x is a starting point, not a measured
+// calibration; tune alongside the zone's own threshold slider if real
+// footage shows this taking too long (or not long enough) to confirm.
+const Z2_MOTION_THRESHOLD_MULTIPLIER = 1.5;
 
 export function DetectorConfigPage() {
   const [config, setConfig] = useState<DetectorConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // This page is always mounted regardless of route (see Layout.tsx), so
+  // useLocation here reflects whether it's actually the visible page, not
+  // whether it's mounted — used below to pause the AI model (the heaviest
+  // continuous cost of the three detection sources: a TensorFlow.js
+  // inference pass every DETECT_INTERVAL_MS, competing with video decode for
+  // the same GPU) while nobody's looking at it. Motion detection — the
+  // primary Z1/Z2/Z3 mechanism everything else this session was built
+  // around — keeps running unconditionally either way.
+  const location = useLocation();
+  const isVisible = location.pathname === '/detector';
 
   // Persists a config change to the backend immediately (optimistic local
   // update first, so the UI never waits on the network). Used by the manual
@@ -134,9 +245,9 @@ export function DetectorConfigPage() {
   const persistConfig = useCallback(async (next: DetectorConfig) => {
     setConfig(next);
     try {
-      const { frame_w, frame_h, zones, masks, video_trigger_taxiway_id, video_trigger_seconds, motion_zones } = next;
+      const { frame_w, frame_h, zones, masks, video_trigger_taxiway_id, video_trigger_seconds, motion_zones, motion_threshold, incursion_line } = next;
       const res = await detectorApi.updateConfig({
-        frame_w, frame_h, zones, masks, video_trigger_taxiway_id, video_trigger_seconds, motion_zones,
+        frame_w, frame_h, zones, masks, video_trigger_taxiway_id, video_trigger_seconds, motion_zones, motion_threshold, incursion_line,
       });
       setConfig(res.data);
     } catch (e) {
@@ -148,6 +259,26 @@ export function DetectorConfigPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const { publish, debug: syncDebug } = useVideoSync(videoRef);
+
+  // Registers this <video> as the one LiveMonitor's VideoFeed mirrors via
+  // canvas instead of decoding its own second copy of the same source — see
+  // detectorVideoRegistry.ts. This page's video is the one that must always
+  // keep decoding (detection depends on it), so it's the natural single
+  // source of truth for any other page that just wants to display the feed.
+  //
+  // Callback ref, not a useEffect(() => ..., []) on videoRef.current: the
+  // <video> element only exists once `config` has loaded (see the `if
+  // (!config) return ...` below) — the first commit renders a loading
+  // placeholder with no <video> in the tree at all. An effect with an empty
+  // dep array fires once against THAT tree, captures null, and never runs
+  // again once the real element mounts a moment later, leaving every other
+  // page's mirror permanently pointed at nothing. A callback ref fires
+  // exactly when the node actually attaches/detaches, so it can't miss the
+  // later mount (or race it) the way effect timing can.
+  const setVideoRef = useCallback((el: HTMLVideoElement | null) => {
+    (videoRef as React.MutableRefObject<HTMLVideoElement | null>).current = el;
+    setDetectorVideoElement(el);
+  }, []);
   // Default 3x — the source clip is mostly idle taxiing, 3x keeps demo
   // pacing tighter without needing a shorter/edited source file.
   const [playbackRate, setPlaybackRate] = useState(3);
@@ -177,23 +308,41 @@ export function DetectorConfigPage() {
 
   // ── Shared trigger plumbing (all 3 detection sources funnel through this) ─
   const modelRef = useRef<cocoSsd.ObjectDetection | null>(null);
-  const lastTriggerAtRef = useRef(0); // Date.now() ms, for TRIGGER_COOLDOWN_MS
+  // Date.now() ms of the last trigger, per cooldown key — motion zones use
+  // their own zone.id as the key (see reportPlaneDetected) so Z1/Z2/Z3 don't
+  // throttle each other: they represent a single plane's Z1(進入聯絡道) ->
+  // Z2(跑道頭等待) -> Z3(起飛) progression firing in quick succession, which
+  // a single shared cooldown would mostly swallow after the first zone.
+  // AI/manual (no zone id) share the fixed key 'default'.
+  const lastTriggerAtRef = useRef<Map<string, number>>(new Map());
   // Kept in a ref (not read from `config` inside the detect loops) so a
   // config edit elsewhere on this page doesn't restart the loops.
   const taxiwayIdRef = useRef('1S');
 
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [lastDetection, setLastDetection] = useState<{ score: number; at: string; source: string } | null>(null);
+  // "AI 判讀現況" — a human-readable read of what the motion zones currently
+  // say is happening on the field (Z1 進入聯絡道 / Z2 跑道頭等待 / Z2+Z3 起飛
+  // — same phase logic AirportSimPanel.spawnAtTaxiway uses for the ground-sim
+  // projection, just surfaced as text here instead of an animated icon).
+  // Kept until the next zone hit rather than clearing every tick nothing
+  // fires — motion sampling is intermittent even for continuous real
+  // motion, so clearing on every quiet tick would just flicker.
+  const [currentStatus, setCurrentStatus] = useState<{ label: string; taxiwayId: string; at: number } | null>(null);
   const [triggerCount, setTriggerCount] = useState(0);
   const [rawPredictions, setRawPredictions] = useState<cocoSsd.DetectedObject[]>([]);
   const [aiEnabled, setAiEnabled] = useState(true);
   const [motionEnabled, setMotionEnabled] = useState(true);
   const [motionLevel, setMotionLevel] = useState(0);
-  const [motionThreshold, setMotionThreshold] = useState(DEFAULT_MOTION_THRESHOLD);
-  // Read inside the tick's setInterval closure via a ref so dragging the
-  // slider doesn't tear down/rebuild the detection interval on every change.
-  const motionThresholdRef = useRef(motionThreshold);
-  useEffect(() => { motionThresholdRef.current = motionThreshold; }, [motionThreshold]);
+  // config.motion_threshold, not local state — persisted (see
+  // DetectorConfigService's DEFAULT_CONFIG for the 0.06 default) so
+  // ZoneConfig.tsx can also show/edit the same value while calibrating
+  // zones. Read inside the tick's setInterval closure via a ref so it
+  // doesn't need to be a dependency of the detection effect.
+  const motionThresholdRef = useRef(0.06);
+  useEffect(() => {
+    if (config) motionThresholdRef.current = config.motion_threshold;
+  }, [config?.motion_threshold]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (config) taxiwayIdRef.current = config.video_trigger_taxiway_id;
@@ -236,28 +385,39 @@ export function DetectorConfigPage() {
   // the "觸發聯絡道" dropdown (AI/manual mark both trigger for the whole
   // frame) — motion detection passes the specific zone's own taxiway_id
   // instead, since each motion zone maps to a different taxiway.
-  const reportPlaneDetected = useCallback(async (source: string, confidence: number, taxiwayId?: string) => {
+  const reportPlaneDetected = useCallback(async (source: string, confidence: number, taxiwayId?: string, zoneId?: string, snapshotBase64?: string) => {
     // Scaled by playback speed, same as the runway alert window — otherwise
     // at e.g. 3x the cooldown (20s fixed) outlasts the alert window (10s),
     // leaving a dead zone where the runway has already gone back to
     // unarmed but new detections are still being suppressed.
     const scaledCooldownMs = TRIGGER_COOLDOWN_MS / playbackRateRef.current;
     const now = Date.now();
-    if (now - lastTriggerAtRef.current < scaledCooldownMs) return;
-    lastTriggerAtRef.current = now;
+    const cooldownKey = zoneId ?? 'default';
+    const lastAt = lastTriggerAtRef.current.get(cooldownKey) ?? 0;
+    if (now - lastAt < scaledCooldownMs) return;
+    lastTriggerAtRef.current.set(cooldownKey, now);
     setTriggerCount((c) => c + 1);
     setLastDetection({ score: confidence, at: new Date().toLocaleTimeString('zh-TW', { hour12: false }), source });
 
+    const resolvedTaxiwayId = taxiwayId ?? taxiwayIdRef.current;
+
     await armRunwayAlert();
     demoApi.detect({
-      taxiway_id: taxiwayId ?? taxiwayIdRef.current,
+      taxiway_id: resolvedTaxiwayId,
       target_type: 'AIRCRAFT',
       confidence,
       entering_runway: true,
       camera_id: source,
+      snapshot_base64: snapshotBase64,
     }).catch(() => {
       // Can still fail (e.g. RWY enable itself failed) — stay quiet.
     });
+
+    // AirportSimPanel's ground-sim projection is driven separately, straight
+    // out of the motion tick loop below (not from here) — it needs to know
+    // which zones fired TOGETHER in the same tick (Z2+Z3 == takeoff, Z1+Z2
+    // == two separate planes — see AirportSimPanel.spawnAtTaxiway), which
+    // this per-zone, per-call function can't see on its own.
   }, [armRunwayAlert]);
 
   // ── 1. AI object detection (TensorFlow.js + COCO-SSD) ───────────────────
@@ -300,7 +460,11 @@ export function DetectorConfigPage() {
   }, []);
 
   useEffect(() => {
-    if (modelStatus !== 'ready' || !aiEnabled) {
+    // Paused while this page isn't the visible one — see isVisible's
+    // comment. Motion detection (below) is unaffected, so RWY 警戒 and the
+    // ground-sim projection keep working from the background even with AI
+    // paused; only AI's own detections (and its overlay boxes) pause.
+    if (modelStatus !== 'ready' || !aiEnabled || !isVisible) {
       if (!aiEnabled) drawOverlay([]);
       return;
     }
@@ -334,7 +498,7 @@ export function DetectorConfigPage() {
 
     const intervalId = setInterval(tick, DETECT_INTERVAL_MS);
     return () => clearInterval(intervalId);
-  }, [modelStatus, aiEnabled, drawOverlay, reportPlaneDetected, armRunwayAlert]);
+  }, [modelStatus, aiEnabled, isVisible, drawOverlay, reportPlaneDetected, armRunwayAlert]);
 
   // ── 2. Motion detection (frame-diff, independent of the AI model) ───────
   const motionCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -345,11 +509,133 @@ export function DetectorConfigPage() {
   // Kept in a ref so the tick loop doesn't need `config` as a dep (avoids
   // restarting the detection interval on every unrelated config edit).
   const motionZonesRef = useRef<DetectorMotionZone[]>([]);
+  // The single 跑道入侵線 (config.incursion_line, drawn on ZoneConfig.tsx) —
+  // kept separate from motionZonesRef since it's scored the same way but
+  // handled differently on a hit (real snapshot, no ground-sim projection).
+  const incursionLineRef = useRef<DetectorMotionZone | null>(null);
+  // Per-taxiway event-determination state (see determineRunwayEvent) — keyed
+  // by taxiway_id, all three reset together whenever zones are redrawn since
+  // a streak/pending count from the old zone layout isn't meaningful once
+  // the rects (and what they mean) have changed.
+  //   z3StreakRef: consecutive ticks Z3 has hit THIS taxiway in a row —
+  //     resets to 0 the instant Z3 misses a tick. Feeds z3Triggered.
+  //   pendingEventRef: the raw event determineRunwayEvent computed on the
+  //     LAST tick for this taxiway, plus how many consecutive ticks it's
+  //     held — resets its count whenever the raw event changes.
+  //   confirmedEventRef: the event actually acted on (emitted/displayed) —
+  //     only updated once pendingEventRef's count reaches EVENT_CONFIRM_TICKS
+  //     AND it differs from what's already confirmed (see 六、避免重複播放).
+  //   runwayHoldingLatchedRef: true forever once Z1+Z2 have EVER hit
+  //     together on the same tick for this taxiway — deliberately NOT reset
+  //     by normal zone flicker (a momentary Z1/Z2 miss, a brief detection
+  //     drop-out), and NOT cleared just because this taxiway's TAKEOFF later
+  //     confirms either (見驗收測試七 — the waiting icon must survive the
+  //     takeoff animation starting, not be cleared as a side effect of it).
+  //     This is what keeps the waiting icon showing continuously even though
+  //     the raw Z1/Z2 booleans themselves come and go — see
+  //     determineRunwayEvent's RUNWAY_HOLDING_PENDING case. Cleared ONLY by
+  //     resetTemporalDetectionState (video seek — including a plain <video
+  //     loop> wrap, which fires the same native events — or an explicit
+  //     demo reset).
+  const z3StreakRef = useRef<Map<string, number>>(new Map());
+  const runwayHoldingLatchedRef = useRef<Map<string, boolean>>(new Map());
+  const pendingEventRef = useRef<Map<string, { event: RunwayEvent; count: number }>>(new Map());
+  const confirmedEventRef = useRef<Map<string, RunwayEvent>>(new Map());
 
   useEffect(() => {
     motionZonesRef.current = config?.motion_zones ?? [];
+    incursionLineRef.current = config?.incursion_line ?? null;
     prevFramesRef.current = new Map(); // zone set/rects changed — old baselines no longer comparable
-  }, [config?.motion_zones]);
+    z3StreakRef.current = new Map();
+    runwayHoldingLatchedRef.current = new Map();
+    pendingEventRef.current = new Map();
+    confirmedEventRef.current = new Map();
+  }, [config?.motion_zones, config?.incursion_line]);
+
+  // ── 影片時間軸跳轉後重新判定 ──────────────────────────────────────────────
+  // A seek (drag the seek bar, click a new time, or ANY page's currentTime =
+  // assignment — see detectorVideoRegistry.ts, every page ultimately shares
+  // this one <video>) invalidates every taxiway's Z1/Z2/Z3 state instantly:
+  // the frame-diff baselines, the Z3 confirm streak, the pending/confirmed
+  // event, and the event cooldown were all built from footage at the OLD
+  // time and describe nothing about what's on screen after the jump.
+  // Listened via the <video>'s own onSeeking/onSeeked props below — the
+  // browser fires these for every possible cause of a jump (this page's own
+  // seek(), VideoFeed.tsx's remote seek via getDetectorVideoElement(),
+  // useVideoSync's catch-up correction, or the video's own `loop` wrap), so
+  // there's no need to separately intercept each call site.
+  const isSeekingRef = useRef(false);
+  // Bumped on every `seeking` — the seek-reanalysis burst (see runSeekBurst)
+  // checks this before each step, so a second seek arriving before the first
+  // one's reanalysis finished makes the stale burst abandon itself instead of
+  // racing the new one.
+  const seekRequestIdRef = useRef(0);
+  const [analysisStatus, setAnalysisStatus] = useState<'IDLE' | 'REANALYZING'>('IDLE');
+
+  // Debug snapshot of the last tick's judgment per taxiway — surfaced in the
+  // debug panel below (seekRequestId/targetTime/motionScore/.../eventReason).
+  // "trackIds" in this system's terms is just which of Z1/Z2/Z3 actually hit
+  // this tick — there's no separate multi-object tracker with its own IDs.
+  interface RunwayDebugSnapshot {
+    motionScore: number;
+    motionThreshold: number;
+    z1: boolean;
+    z2: boolean;
+    z3: boolean;
+    z3Triggered: boolean;
+    z2Motion: boolean;
+    runwayHoldingLatched: boolean;
+    runwayHoldingState: 'IDLE' | 'ICON_LATCHED' | 'ANIMATING' | 'COMPLETED';
+    candidateEvent: RunwayEvent;
+    confirmedEvent: RunwayEvent;
+    animationType: 'TAKEOFF_CLIMB' | 'RUNWAY_HOLDING_WAIT' | 'NONE';
+    eventReason: string;
+  }
+  const [runwayDebug, setRunwayDebug] = useState<Record<string, RunwayDebugSnapshot>>({});
+  const [seekDebug, setSeekDebug] = useState<{ seekRequestId: number; targetTime: number } | null>(null);
+
+  // Single reset point for every piece of per-taxiway temporal state the
+  // tick loop accumulates — mirrors the "十、重置函式" list exactly: only
+  // clears the transient judgment state used for THIS frame's decision, never
+  // the permanent event/audit records (those live server-side and are
+  // untouched here).
+  const resetTemporalDetectionState = useCallback(() => {
+    prevFramesRef.current = new Map();          // 舊的 Motion 狀態（frame-diff baseline）
+    z3StreakRef.current = new Map();            // 舊的連續影格計數
+    runwayHoldingLatchedRef.current = new Map(); // 舊的鎖存等待狀態 — one of the few things allowed to clear this latch, see its declaration comment
+    pendingEventRef.current = new Map();        // 舊的候選事件
+    confirmedEventRef.current = new Map();      // 舊的確認事件
+    lastTriggerAtRef.current = new Map();       // 舊的事件 Cooldown
+    setCurrentStatus(null);                     // 舊的 Icon
+    setRunwayDebug({});
+  }, []);
+
+  const handleVideoSeeking = useCallback(() => {
+    isSeekingRef.current = true;
+    seekRequestIdRef.current += 1;
+    resetTemporalDetectionState();
+    setAnalysisStatus('REANALYZING');
+    // 舊的 Track 暫存狀態 — tells AirportSimPanel to drop any LIVE-tracked
+    // vehicle and stop whatever animation (起飛/等待) it was mid-playing;
+    // this page has no direct handle to that panel, only this socket event.
+    getSocket().emit('detector:video-seeking');
+  }, [resetTemporalDetectionState]);
+
+  // Server-broadcast when an operator explicitly resets the demo scene (see
+  // DetectorAlertService.notifyDemoReset) — one of the few things allowed to
+  // clear runwayHoldingLatchedRef (十、鎖存狀態的清除時機). Also emits the
+  // same 'detector:video-seeking' AirportSimPanel already listens for, so a
+  // demo reset drops any LIVE-tracked vehicle/animation the same way a seek
+  // does — a reset invalidates that just as thoroughly as a time jump does.
+  useEffect(() => {
+    const socket = getSocket();
+    const onDemoReset = () => {
+      resetTemporalDetectionState();
+      socket.emit('detector:video-seeking');
+    };
+    socket.on('detector:demo-reset', onDemoReset);
+    return () => { socket.off('detector:demo-reset', onDemoReset); };
+  }, [resetTemporalDetectionState]);
 
   // Scores one zone's rect against its own running baseline. Reuses a single
   // shared canvas across zones/ticks (sequential draws — cheap, no need for
@@ -385,70 +671,339 @@ export function DetectorConfigPage() {
     return changed / totalPixels;
   }, []);
 
+  // Grabs the CURRENT full video frame as a JPEG for a 跑道入侵線 hit — real
+  // evidence attached to the resulting event instead of the generated
+  // placeholder (see SimulationEngine.processDetection's snapshotBase64).
+  // Capped at 960px wide (not the native frame) to keep the JSON payload a
+  // reasonable size; incursion evidence doesn't need full resolution to be
+  // useful.
+  const snapshotCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const captureSnapshot = useCallback((video: HTMLVideoElement): string | undefined => {
+    if (!video.videoWidth) return undefined;
+    if (!snapshotCanvasRef.current) snapshotCanvasRef.current = document.createElement('canvas');
+    const canvas = snapshotCanvasRef.current;
+    const scale = Math.min(1, 960 / video.videoWidth);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    try {
+      return canvas.toDataURL('image/jpeg', 0.85);
+    } catch {
+      return undefined; // e.g. tainted canvas — fail quiet, event still gets created without a snapshot
+    }
+  }, []);
+
+  // Extracted from the interval effect below (not just an inline closure) so
+  // handleVideoSeeked's reanalysis burst can also call it directly, several
+  // times in quick succession, to rebuild z3Triggered/event confirmation
+  // faster than waiting out DETECT_INTERVAL_MS-paced ticks. Calling it more
+  // than once close together (interval tick + burst overlapping) is safe —
+  // it always just samples whatever the CURRENT frame is against whatever
+  // baseline is currently stored, nothing here is order- or timing-sensitive
+  // beyond that.
+  const runDetectionTick = useCallback(() => {
+      const video = videoRef.current;
+      if (!video || video.readyState < 2) return;
+      const zones = motionZonesRef.current;
+      const incursionLine = incursionLineRef.current;
+      if (zones.length === 0 && !incursionLine) {
+        setMotionLevel(0);
+        return; // nothing configured to scan
+      }
+
+      let maxScore = 0;
+      // Zones that hit threshold THIS tick — keyed by object identity (a
+      // Set), not zone.id, since two different taxiways can each have their
+      // own zone reusing the label 'Z1'/'Z2'/'Z3'.
+      const hitZones = new Set<DetectorMotionZone>();
+      // Raw score per zone this tick — only needed for the debug panel below
+      // (seekDebug/runwayDebug), doesn't feed any judgment logic.
+      const scoreByZone = new Map<DetectorMotionZone, number>();
+      for (const zone of zones) {
+        const score = computeZoneScore(video, zone);
+        scoreByZone.set(zone, score);
+        if (score > maxScore) maxScore = score;
+        // Per-zone threshold override (zone.threshold) falls back to the
+        // shared default — see DetectorMotionZone's comment.
+        if (score >= (zone.threshold ?? motionThresholdRef.current)) {
+          // Real-time safety reporting (runway alert + backend incursion
+          // pipeline) — deliberately immediate, per-zone, NOT gated behind
+          // the event-confirmation logic below. That confirmation exists to
+          // stop the ground-sim animation/status text from reacting to a
+          // single noisy frame; it must not also delay the actual alert.
+          armRunwayAlert();
+          reportPlaneDetected('DETECTOR-VIDEO-MOTION', Math.min(0.95, 0.5 + score * 10), zone.taxiway_id, zone.id);
+          hitZones.add(zone);
+        }
+      }
+
+      // ── 事件判定（先完成判定，再播放動畫）────────────────────────────────
+      // Collect this tick's COMPLETE zone snapshot per taxiway first — never
+      // act on a single zone's hit in isolation. Z1/Z2/Z3 are matched by
+      // object identity within that taxiway's own zone list, not a bare id
+      // lookup, for the same multi-taxiway reason as hitZones above.
+      const zonesByTaxiway = new Map<string, DetectorMotionZone[]>();
+      for (const zone of zones) {
+        const list = zonesByTaxiway.get(zone.taxiway_id) ?? [];
+        list.push(zone);
+        zonesByTaxiway.set(zone.taxiway_id, list);
+      }
+
+      // "AI 判讀現況" reuses the exact same confirmed event this loop just
+      // computed for the ground-sim spawn below — one source of truth for
+      // both, instead of two separately-derived readings that can disagree.
+      // If more than one taxiway has a confirmed event this tick, shows
+      // whichever is furthest along (TAKEOFF > RUNWAY_HOLDING).
+      let bestLabel: string | null = null;
+      let bestTaxiway: string | null = null;
+      let bestRank = -1;
+      const nextDebug: Record<string, RunwayDebugSnapshot> = {};
+
+      for (const [taxiwayId, taxiwayZones] of zonesByTaxiway) {
+        const z1zone = taxiwayZones.find((z) => z.id === 'Z1');
+        const z2zone = taxiwayZones.find((z) => z.id === 'Z2');
+        const z3zone = taxiwayZones.find((z) => z.id === 'Z3');
+        const z1 = !!z1zone && hitZones.has(z1zone);
+        const z2 = !!z2zone && hitZones.has(z2zone);
+        const z3 = !!z3zone && hitZones.has(z3zone);
+
+        // Z1 alone is a real detection but deliberately NOT a formal event in
+        // determineRunwayEvent (NONE — see its comment/acceptance table,
+        // unchanged). Without this, the ground-sim panel would have nothing
+        // to show until RUNWAY_HOLDING (needs Z1 AND Z2 in the SAME tick) —
+        // and since those zones are normally drawn as physically separate
+        // spots along the taxiway, a plane usually leaves Z1's box before
+        // ever entering Z2's, so that combination can go long stretches
+        // without firing at all and the plane icon just never appears. This
+        // is a separate, lighter-weight "a plane showed up" ping — not
+        // debounced through EVENT_CONFIRM_TICKS like TAKEOFF/RUNWAY_HOLDING,
+        // doesn't touch confirmedEventRef/currentStatus, and can't affect
+        // determineRunwayEvent's verdict. Worst case of firing on a single
+        // noisy tick is a vehicle appearing slightly early, not a wrong
+        // safety verdict; AirportSimPanel's own onField/MIN_SPAWN_GAP_MS
+        // checks already make repeat emits a no-op once one vehicle exists.
+        if (z1 && !z2 && !z3) {
+          getSocket().emit('sim:spawn-at-taxiway', { taxiway_id: taxiwayId, event: 'ENTERING' });
+        }
+
+        // 三、Z1＋Z2 Trigger 後鎖存等待 Icon — latches PERMANENTLY the instant
+        // Z1 and Z2 have EVER hit together on the same tick; deliberately
+        // checked against the RAW z1/z2 (not any confirmed/streak version)
+        // since "曾經同時被 Trigger 一次" only needs one real co-occurrence,
+        // not sustained motion — sustained motion is z2Motion's job below,
+        // which gates the animation, not this latch. Never cleared here —
+        // only resetTemporalDetectionState (seek/demo reset) or a fresh
+        // TAKEOFF confirmation (a few lines down) may clear it.
+        if (z1 && z2) {
+          runwayHoldingLatchedRef.current.set(taxiwayId, true);
+        }
+        const runwayHoldingLatched = runwayHoldingLatchedRef.current.get(taxiwayId) ?? false;
+
+        // Z3 must hit EVENT_CONFIRM_TICKS ticks in a row before it counts as
+        // triggered — one frame alone (Z3.motion true but not yet sustained)
+        // is never enough on its own (起飛必要條件 / Trigger 與 Motion 的關係).
+        const z3Streak = z3 ? (z3StreakRef.current.get(taxiwayId) ?? 0) + 1 : 0;
+        z3StreakRef.current.set(taxiwayId, z3Streak);
+        const z3Triggered = z3Streak >= EVENT_CONFIRM_TICKS;
+
+        // Z2.motion is NOT "Z2 detected, confirmed over a few ticks" the way
+        // z3Triggered is for Z3 — a streak-based confirm can't work here,
+        // since Z2 can legitimately keep triggering every single tick (the
+        // plane is sitting right there) while genuinely NOT showing "motion"
+        // in the stronger sense this needs; a streak would just build up to
+        // true within EVENT_CONFIRM_TICKS ticks regardless, making it
+        // indistinguishable from Z2.triggered and unable to stay apart from
+        // it the way 四、五 requires (顯示Icon但動畫保持不動, sustained, until
+        // something ACTUALLY changes). Instead Z2.motion needs a
+        // proportionally STRONGER score than Z2.triggered's own threshold —
+        // a plane merely present/lingering right at the detection edge
+        // trips z2 without necessarily tripping z2Motion; one that's
+        // genuinely, actively moving through the zone scores well above it.
+        const z2Threshold = z2zone?.threshold ?? motionThresholdRef.current;
+        const z2Score = z2zone ? (scoreByZone.get(z2zone) ?? 0) : 0;
+        const z2Motion = z2Score >= z2Threshold * Z2_MOTION_THRESHOLD_MULTIPLIER;
+
+        const rawEvent = determineRunwayEvent({ z1, z2, z3, z3Triggered, runwayHoldingLatched, z2Motion });
+
+        // Debounce the FINAL event itself too — must hold for
+        // EVENT_CONFIRM_TICKS consecutive ticks before it's accepted, so a
+        // combo that flickers between two readings can't restart/switch the
+        // animation every tick either. Nothing below this point (status
+        // text, sim spawn) reacts until a NEW value survives that window.
+        const pending = pendingEventRef.current.get(taxiwayId);
+        const pendingCount = pending && pending.event === rawEvent ? pending.count + 1 : 1;
+        pendingEventRef.current.set(taxiwayId, { event: rawEvent, count: pendingCount });
+
+        const alreadyConfirmed = confirmedEventRef.current.get(taxiwayId) ?? 'NONE';
+        let confirmed = alreadyConfirmed;
+        if (pendingCount >= EVENT_CONFIRM_TICKS && alreadyConfirmed !== rawEvent) {
+          confirmed = rawEvent;
+          confirmedEventRef.current.set(taxiwayId, confirmed);
+          // 動畫狀態鎖 — second, explicit check right before this is allowed
+          // to trigger the takeoff animation, independent of
+          // determineRunwayEvent's own check a few lines up (播放前必須再次
+          //檢查). Provably redundant given `confirmed` can only equal
+          // 'TAKEOFF' via a rawEvent that already required z3Triggered — kept
+          // anyway as a hard, auditable gate so a future edit to
+          // determineRunwayEvent (or anything upstream of it) can't silently
+          // start the takeoff animation without Z3 actually triggered; fails
+          // closed (skips the emit) rather than trusting the caller.
+          const takeoffAnimationGateOpen = confirmed !== 'TAKEOFF' || z3Triggered === true;
+          // Only TAKEOFF/RUNWAY_HOLDING ever reach the ground-sim — PENDING
+          // is icon-only (see determineRunwayEvent's comment): AirportSimPanel
+          // never even hears about it, so there is nothing there for it to
+          // accidentally animate.
+          const isAnimationWorthy = confirmed === 'TAKEOFF' || confirmed === 'RUNWAY_HOLDING';
+          if (isAnimationWorthy && takeoffAnimationGateOpen) {
+            getSocket().emit('sim:spawn-at-taxiway', { taxiway_id: taxiwayId, event: confirmed });
+          }
+          // NOT cleared here on TAKEOFF, deliberately — 十、事件優先順序 is
+          // explicit that a confirmed TAKEOFF must never accidentally clear
+          // the waiting icon's latch just because the takeoff animation
+          // started playing (見驗收測試七). 九、鎖存狀態的清除時機 #3 ("系統
+          // 明確完成該次等待事件，且確認飛機已離開相關區域") needs actual
+          // confirmation the plane left, which TAKEOFF merely STARTING
+          // doesn't provide — the plane is still on screen mid-departure.
+          // In practice this taxiway's latch clears at the next video loop
+          // wrap/seek anyway (handleVideoSeeking already resets it — a
+          // <video loop> wrap fires the same native seeking/seeked events as
+          // any other jump), which is a reasonable proxy for "this pass of
+          // the scene is over" without needing a separate, more fragile
+          // "zones have gone quiet" heuristic.
+        }
+
+        if (confirmed !== 'NONE') {
+          const rank = confirmed === 'TAKEOFF' ? 3 : confirmed === 'RUNWAY_HOLDING' ? 2 : 1;
+          if (rank > bestRank) {
+            bestRank = rank;
+            bestLabel = RUNWAY_EVENT_LABELS[confirmed];
+            bestTaxiway = taxiwayId;
+          }
+        }
+
+        // 八、狀態機 — purely a derived display value for the debug panel, not
+        // a separately-maintained state variable (avoids a second source of
+        // truth): COMPLETED is only ever visible for the one tick TAKEOFF
+        // first confirms, since the latch-clear above already ran by the
+        // time this is built; the NEXT tick reads back as IDLE.
+        const latchedNow = runwayHoldingLatchedRef.current.get(taxiwayId) ?? false;
+        const runwayHoldingState: RunwayDebugSnapshot['runwayHoldingState'] =
+          confirmed === 'TAKEOFF' ? 'COMPLETED'
+          : !latchedNow ? 'IDLE'
+          : confirmed === 'RUNWAY_HOLDING' ? 'ANIMATING'
+          : 'ICON_LATCHED';
+
+        nextDebug[taxiwayId] = {
+          motionScore: z3zone ? (scoreByZone.get(z3zone) ?? 0) : 0,
+          motionThreshold: z3zone?.threshold ?? motionThresholdRef.current,
+          z1, z2, z3, z3Triggered,
+          z2Motion,
+          runwayHoldingLatched: latchedNow,
+          runwayHoldingState,
+          candidateEvent: rawEvent,
+          confirmedEvent: confirmed,
+          animationType: confirmed === 'TAKEOFF' ? 'TAKEOFF_CLIMB' : confirmed === 'RUNWAY_HOLDING' ? 'RUNWAY_HOLDING_WAIT' : 'NONE',
+          eventReason: confirmed === 'TAKEOFF'
+            ? 'Z3_TRIGGERED'
+            : confirmed === 'RUNWAY_HOLDING'
+              ? 'Z1_Z2_LATCHED_AND_Z2_MOTION'
+              : confirmed === 'RUNWAY_HOLDING_PENDING'
+                ? `WAITING_FOR_Z2_MOTION (score ${(z2Score * 100).toFixed(1)}% / need ${(z2Threshold * Z2_MOTION_THRESHOLD_MULTIPLIER * 100).toFixed(1)}%)`
+                : z3 ? `Z3 detected, awaiting confirm (${z3StreakRef.current.get(taxiwayId) ?? 0}/${EVENT_CONFIRM_TICKS})` : 'NO_CONFIRMED_EVENT',
+        };
+      }
+      setRunwayDebug(nextDebug);
+      if (bestLabel && bestTaxiway) {
+        setCurrentStatus({ label: bestLabel, taxiwayId: bestTaxiway, at: Date.now() });
+      }
+
+      // 跑道入侵線 — same scoring, but never feeds the ground-sim projection
+      // (that's Z1/Z2/Z3's job); this is a real safety trigger, so it always
+      // grabs a snapshot of the actual frame instead. Backend already checks
+      // the taxiway's real authorization state and only latches
+      // INCURSION_LATCHED if it wasn't authorized — no separate check needed
+      // here, crossing the line just reports "something crossed" the same
+      // way any zone does.
+      if (incursionLine) {
+        const score = computeZoneScore(video, incursionLine);
+        if (score > maxScore) maxScore = score;
+        if (score >= (incursionLine.threshold ?? motionThresholdRef.current)) {
+          armRunwayAlert();
+          reportPlaneDetected(
+            'DETECTOR-INCURSION-LINE',
+            Math.min(0.95, 0.5 + score * 10),
+            incursionLine.taxiway_id,
+            incursionLine.id,
+            captureSnapshot(video),
+          );
+        }
+      }
+
+      setMotionLevel(maxScore);
+  }, [computeZoneScore, captureSnapshot, reportPlaneDetected, armRunwayAlert]);
+
   useEffect(() => {
     if (!motionEnabled) {
       setMotionLevel(0);
       prevFramesRef.current = new Map(); // avoid a stale-diff false trigger on re-enable
       return;
     }
-
-    const tick = () => {
-      const video = videoRef.current;
-      if (!video || video.readyState < 2) return;
-      const zones = motionZonesRef.current;
-      if (zones.length === 0) {
-        setMotionLevel(0);
-        return; // nothing configured to scan
-      }
-
-      let maxScore = 0;
-      for (const zone of zones) {
-        const score = computeZoneScore(video, zone);
-        if (score > maxScore) maxScore = score;
-        if (score >= motionThresholdRef.current) {
-          // Same as the AI tick: reset the alert window every time motion is
-          // still seen, independent of reportPlaneDetected's event cooldown.
-          armRunwayAlert();
-          reportPlaneDetected('DETECTOR-VIDEO-MOTION', Math.min(0.95, 0.5 + score * 10), zone.taxiway_id);
-        }
-      }
-      setMotionLevel(maxScore);
-    };
-
-    const intervalId = setInterval(tick, DETECT_INTERVAL_MS);
+    const intervalId = setInterval(runDetectionTick, DETECT_INTERVAL_MS);
     return () => clearInterval(intervalId);
-  }, [motionEnabled, computeZoneScore, reportPlaneDetected, armRunwayAlert]);
+  }, [motionEnabled, runDetectionTick]);
 
-  // ── Motion region drawing (drag a rect on the video, like the old Zone
-  // editor) ─────────────────────────────────────────────────────────────
-  const regionCanvasRef = useRef<HTMLCanvasElement>(null);
-  const [drawingRegion, setDrawingRegion] = useState(false);
-  const regionDragRef = useRef<{ active: boolean; x1: number; y1: number; x2: number; y2: number }>({
-    active: false, x1: 0, y1: 0, x2: 0, y2: 0,
-  });
+  // Several closely-spaced extra runDetectionTick() calls right after a seek
+  // completes — rebuilds z3Triggered/event confirmation in well under a
+  // second instead of waiting out DETECT_INTERVAL_MS-paced ticks (up to
+  // ~2.5s worst case for a fresh TAKEOFF confirmation from a cold reset:
+  // EVENT_CONFIRM_TICKS ticks to build z3Triggered, then EVENT_CONFIRM_TICKS
+  // more for the final event debounce). Mirrors the spec's
+  // SEEK_ANALYSIS_FRAMES idea, implemented by calling the SAME tick function
+  // the normal interval uses (not a separate/duplicated analysis path) —
+  // extra samples close together are harmless (see runDetectionTick's
+  // comment), so this can safely run alongside the normal interval rather
+  // than needing to pause/replace it.
+  const SEEK_BURST_TICKS = 5;
+  const SEEK_BURST_INTERVAL_MS = 120;
+  const runSeekBurst = useCallback((requestId: number) => {
+    let i = 0;
+    const step = () => {
+      if (seekRequestIdRef.current !== requestId) return; // superseded by a newer seek — abandon
+      runDetectionTick();
+      i += 1;
+      if (i < SEEK_BURST_TICKS) {
+        setTimeout(step, SEEK_BURST_INTERVAL_MS);
+      } else if (seekRequestIdRef.current === requestId) {
+        isSeekingRef.current = false;
+        setAnalysisStatus('IDLE');
+      }
+    };
+    setTimeout(step, SEEK_BURST_INTERVAL_MS);
+  }, [runDetectionTick]);
 
-  // Keeps the region canvas's internal pixel buffer matched to the video's
-  // native resolution. Called from both drawRegionOverlay (rendering) and
-  // regionCanvasPos (mouse-to-video coordinate conversion) so the canvas can
-  // never be read/drawn against a stale size — that mismatch is exactly what
-  // caused a drawn region to save the wrong rect (canvas defaults to 300x150
-  // until something resizes it; if a drag starts before that happens, the
-  // saved coordinates come out scaled against 300x150 instead of the real
-  // e.g. 1920x1080, landing nowhere near where the operator actually dragged).
-  const ensureRegionCanvasSized = useCallback((): HTMLCanvasElement | null => {
-    const canvas = regionCanvasRef.current;
+  const handleVideoSeeked = useCallback(() => {
+    const requestId = seekRequestIdRef.current;
+    setSeekDebug({ seekRequestId: requestId, targetTime: videoRef.current?.currentTime ?? 0 });
+    runSeekBurst(requestId);
+  }, [runSeekBurst]);
+
+  // ── Motion zone overlay — READ-ONLY on this page. Drawing/editing zones
+  // lives on ZoneConfig.tsx ("偵測區域設定") now; this just renders
+  // config.motion_zones on top of the live video for visual confirmation of
+  // what's currently being scanned, since the actual scanning loop (above)
+  // has to stay on this page's always-running <video> regardless.
+  const zoneOverlayRef = useRef<HTMLCanvasElement>(null);
+
+  const drawZoneOverlay = useCallback(() => {
+    const canvas = zoneOverlayRef.current;
     const video = videoRef.current;
-    if (!canvas || !video || !video.videoWidth) return null;
+    if (!canvas || !video || !video.videoWidth) return;
     if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
     }
-    return canvas;
-  }, []);
-
-  const drawRegionOverlay = useCallback(() => {
-    const canvas = ensureRegionCanvasSized();
-    if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -463,75 +1018,28 @@ export function DetectorConfigPage() {
       ctx.strokeRect(rect.x1, rect.y1, rect.x2 - rect.x1, rect.y2 - rect.y1);
       ctx.fillStyle = color;
       ctx.font = '14px monospace';
-      ctx.fillText(`${zone.id} · ${zone.taxiway_id}`, rect.x1 + 4, rect.y1 > 16 ? rect.y1 - 4 : rect.y1 + 16);
+      const label = ZONE_PHASE_LABELS[zone.id] ? `${zone.id} · ${ZONE_PHASE_LABELS[zone.id]}` : zone.id;
+      ctx.fillText(label, rect.x1 + 4, rect.y1 > 16 ? rect.y1 - 4 : rect.y1 + 16);
     });
 
-    if (regionDragRef.current.active) {
-      const drag = normalizeRect(regionDragRef.current.x1, regionDragRef.current.y1, regionDragRef.current.x2, regionDragRef.current.y2);
-      ctx.fillStyle = 'rgba(255,255,255,0.15)';
-      ctx.fillRect(drag.x1, drag.y1, drag.x2 - drag.x1, drag.y2 - drag.y1);
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(drag.x1, drag.y1, drag.x2 - drag.x1, drag.y2 - drag.y1);
+    // 跑道入侵線 — same red/dashed treatment as ZoneConfig.tsx, so it reads as
+    // the safety boundary it is on this page's video too.
+    if (config?.incursion_line) {
+      const { rect } = config.incursion_line;
+      ctx.fillStyle = 'rgba(255,68,68,0.12)';
+      ctx.fillRect(rect.x1, rect.y1, rect.x2 - rect.x1, rect.y2 - rect.y1);
+      ctx.strokeStyle = '#ff4444';
+      ctx.lineWidth = 3;
+      ctx.setLineDash([10, 6]);
+      ctx.strokeRect(rect.x1, rect.y1, rect.x2 - rect.x1, rect.y2 - rect.y1);
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#ff4444';
+      ctx.font = 'bold 14px monospace';
+      ctx.fillText(`入侵線 · ${config.incursion_line.taxiway_id}`, rect.x1 + 4, rect.y1 > 16 ? rect.y1 - 4 : rect.y1 + 16);
     }
-  }, [config?.motion_zones, ensureRegionCanvasSized]);
+  }, [config?.motion_zones, config?.incursion_line]);
 
-  useEffect(() => { drawRegionOverlay(); }, [drawRegionOverlay]);
-
-  const regionCanvasPos = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    // Defensive resize right before reading position — see
-    // ensureRegionCanvasSized's comment for why this can't be skipped.
-    const canvas = ensureRegionCanvasSized() ?? regionCanvasRef.current!;
-    const rect = canvas.getBoundingClientRect();
-    return {
-      x: (e.clientX - rect.left) * (canvas.width / rect.width),
-      y: (e.clientY - rect.top) * (canvas.height / rect.height),
-    };
-  };
-
-  const onRegionMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!drawingRegion) return;
-    const { x, y } = regionCanvasPos(e);
-    regionDragRef.current = { active: true, x1: x, y1: y, x2: x, y2: y };
-  };
-
-  const onRegionMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!regionDragRef.current.active) return;
-    const { x, y } = regionCanvasPos(e);
-    regionDragRef.current.x2 = x;
-    regionDragRef.current.y2 = y;
-    drawRegionOverlay();
-  };
-
-  const onRegionMouseUp = () => {
-    if (!regionDragRef.current.active || !config) return;
-    regionDragRef.current.active = false;
-    const r = normalizeRect(regionDragRef.current.x1, regionDragRef.current.y1, regionDragRef.current.x2, regionDragRef.current.y2);
-    if (r.x2 - r.x1 < 8 || r.y2 - r.y1 < 8) {
-      drawRegionOverlay(); // ignore accidental clicks/tiny drags
-      return;
-    }
-    const newZone: DetectorMotionZone = {
-      id: nextZoneId(config.motion_zones),
-      rect: r,
-      taxiway_id: config.video_trigger_taxiway_id,
-    };
-    persistConfig({ ...config, motion_zones: [...config.motion_zones, newZone] });
-    setDrawingRegion(false);
-  };
-
-  const removeMotionZone = (zoneId: string) => {
-    if (!config) return;
-    persistConfig({ ...config, motion_zones: config.motion_zones.filter((z) => z.id !== zoneId) });
-  };
-
-  const setMotionZoneTaxiway = (zoneId: string, taxiwayId: string) => {
-    if (!config) return;
-    persistConfig({
-      ...config,
-      motion_zones: config.motion_zones.map((z) => (z.id === zoneId ? { ...z, taxiway_id: taxiwayId } : z)),
-    });
-  };
+  useEffect(() => { drawZoneOverlay(); }, [drawZoneOverlay]);
 
   // ── 3. Manual marks — fires when playback crosses a marked timestamp ────
   const firedThisLoopRef = useRef<Set<number>>(new Set());
@@ -669,7 +1177,7 @@ export function DetectorConfigPage() {
           <div className="flex-shrink-0" style={{ width: 640 }}>
             <div className="relative">
               <video
-                ref={videoRef}
+                ref={setVideoRef}
                 src="/api/detector/video"
                 autoPlay
                 loop
@@ -677,30 +1185,16 @@ export function DetectorConfigPage() {
                 playsInline
                 onLoadedMetadata={(e) => {
                   setDuration(e.currentTarget.duration || 0);
-                  // Size the region canvas to the video's native resolution
-                  // as soon as we know it — without this, the FIRST drag
-                  // (before metadata loads) computes mouse coordinates
-                  // against the canvas's default 300x150 buffer instead of
-                  // the real video size, saving a region that doesn't match
-                  // what was visually drawn at all. See drawRegionOverlay.
-                  drawRegionOverlay();
+                  drawZoneOverlay();
                 }}
                 onTimeUpdate={handleVideoTimeUpdate}
+                onSeeking={handleVideoSeeking}
+                onSeeked={handleVideoSeeked}
                 className="rounded-t border border-gray-800 bg-black block w-full"
               />
               <canvas ref={overlayRef} className="absolute inset-0 w-full h-full pointer-events-none" />
-              <canvas
-                ref={regionCanvasRef}
-                onMouseDown={onRegionMouseDown}
-                onMouseMove={onRegionMouseMove}
-                onMouseUp={onRegionMouseUp}
-                className="absolute inset-0 w-full h-full"
-                style={{ pointerEvents: drawingRegion ? 'auto' : 'none', cursor: drawingRegion ? 'crosshair' : 'default' }}
-              />
+              <canvas ref={zoneOverlayRef} className="absolute inset-0 w-full h-full pointer-events-none" />
             </div>
-            {drawingRegion && (
-              <div className="text-[10px] text-cyan-400 mt-1">拖曳畫出動態偵測範圍，放開滑鼠確認</div>
-            )}
             <div className="px-2 py-1.5 bg-[#0a0a0a] border border-t-0 border-gray-800 rounded-b">
               <input
                 type="range"
@@ -778,17 +1272,27 @@ export function DetectorConfigPage() {
                 動態偵測{motionEnabled ? ` · ${(motionLevel * 100).toFixed(1)}%` : '（已關閉）'}
               </label>
 
-              <button
-                onClick={() => setDrawingRegion((v) => !v)}
-                className="px-2 py-1 rounded text-[11px] border transition-colors"
+              <Link
+                to="/detector/zones"
+                className="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] border border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition-colors"
+              >
+                <Frame className="w-3 h-3" />
+                管理偵測區域（{config.motion_zones.length}）
+              </Link>
+
+              <Link
+                to="/detector/zones"
+                title="凡未經授權跨越此線，即時拍照存入事件中心"
+                className="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] border transition-colors"
                 style={
-                  drawingRegion
-                    ? { borderColor: '#00c8ff', background: 'rgba(0,200,255,0.15)', color: '#00c8ff' }
-                    : { borderColor: '#374151', background: 'transparent', color: '#9ca3af' }
+                  config.incursion_line
+                    ? { borderColor: 'rgba(255,68,68,0.3)', background: 'rgba(255,68,68,0.1)', color: '#f87171' }
+                    : { borderColor: '#374151', background: 'transparent', color: '#6b7280' }
                 }
               >
-                {drawingRegion ? '框選中...' : '新增偵測區域'}
-              </button>
+                <AlertTriangle className="w-3 h-3" />
+                跑道入侵線{config.incursion_line ? ` · ${config.incursion_line.taxiway_id}` : '（未設定）'}
+              </Link>
 
               <label className="flex items-center gap-1.5 text-xs text-gray-500">
                 觸發聯絡道
@@ -804,12 +1308,12 @@ export function DetectorConfigPage() {
 
             {motionEnabled && (
               <div>
-                <div className="h-1.5 rounded bg-gray-800 overflow-hidden" title={`動態偵測門檻 ${(motionThreshold * 100).toFixed(0)}%`}>
+                <div className="h-1.5 rounded bg-gray-800 overflow-hidden" title={`動態偵測門檻 ${(config.motion_threshold * 100).toFixed(0)}%`}>
                   <div
                     className="h-full transition-all"
                     style={{
-                      width: `${Math.min(100, (motionLevel / (motionThreshold * 3)) * 100)}%`,
-                      background: motionLevel >= motionThreshold ? '#00c8ff' : '#374151',
+                      width: `${Math.min(100, (motionLevel / (config.motion_threshold * 3)) * 100)}%`,
+                      background: motionLevel >= config.motion_threshold ? '#00c8ff' : '#374151',
                     }}
                   />
                 </div>
@@ -820,35 +1324,36 @@ export function DetectorConfigPage() {
                     min={0.01}
                     max={0.3}
                     step={0.01}
-                    value={motionThreshold}
-                    onChange={(e) => setMotionThreshold(parseFloat(e.target.value))}
+                    value={config.motion_threshold}
+                    onChange={(e) => persistConfig({ ...config, motion_threshold: parseFloat(e.target.value) })}
                     className="w-full h-1 accent-cyan-400 cursor-pointer"
                   />
                   <span className="font-mono text-[10px] text-gray-500 shrink-0 w-9 text-right">
-                    {(motionThreshold * 100).toFixed(0)}%
+                    {(config.motion_threshold * 100).toFixed(0)}%
                   </span>
                 </div>
                 {config.motion_zones.length === 0 ? (
-                  <div className="text-[11px] text-gray-600 mt-1.5">尚未設定偵測區域，動態偵測不會掃描任何畫面。</div>
+                  <div className="text-[11px] text-gray-600 mt-1.5">
+                    尚未設定偵測區域，動態偵測不會掃描任何畫面。前往「
+                    <Link to="/detector/zones" className="text-cyan-400 hover:underline">管理偵測區域</Link>
+                    」新增。
+                  </div>
                 ) : (
+                  // Read-only — editing lives on the ZoneConfig.tsx page (see
+                  // the "管理偵測區域" link above). This just confirms what's
+                  // currently being scanned on this page's live video.
                   <div className="flex flex-wrap gap-1.5 mt-1.5">
                     {config.motion_zones.map((zone, i) => (
                       <div
                         key={zone.id}
-                        className="flex items-center gap-1.5 pl-2 pr-1 py-1 rounded border text-[11px]"
+                        className="flex items-center gap-1.5 px-2 py-1 rounded border text-[11px]"
                         style={{ borderColor: ZONE_COLORS[i % ZONE_COLORS.length] + '55', background: ZONE_COLORS[i % ZONE_COLORS.length] + '14' }}
                       >
                         <span style={{ color: ZONE_COLORS[i % ZONE_COLORS.length] }} className="font-mono">{zone.id}</span>
-                        <select
-                          value={zone.taxiway_id}
-                          onChange={(e) => setMotionZoneTaxiway(zone.id, e.target.value)}
-                          className="bg-gray-800 border border-gray-700 rounded px-1 py-0.5 text-gray-300"
-                        >
-                          {ALL_TAXIWAY_IDS.map((id) => <option key={id} value={id}>{id}</option>)}
-                        </select>
-                        <button onClick={() => removeMotionZone(zone.id)} className="text-gray-600 hover:text-red-400">
-                          <Trash2 className="w-2.5 h-2.5" />
-                        </button>
+                        {ZONE_PHASE_LABELS[zone.id] && (
+                          <span className="text-gray-600">{ZONE_PHASE_LABELS[zone.id]}</span>
+                        )}
+                        <span className="text-gray-500 font-mono">{zone.taxiway_id}</span>
                       </div>
                     ))}
                   </div>
@@ -863,6 +1368,48 @@ export function DetectorConfigPage() {
                   ? <span>{lastDetection.source.replace('DETECTOR-VIDEO-', '')} · 信心值 {(lastDetection.score * 100).toFixed(0)}% · {lastDetection.at}</span>
                   : <span className="text-gray-600">尚未偵測到飛機</span>}
               </div>
+              <div className="flex items-center gap-2 text-gray-400">
+                <span className="text-gray-600 w-24 shrink-0">AI 判讀現況</span>
+                {analysisStatus === 'REANALYZING' ? (
+                  <span className="flex items-center gap-1.5 text-yellow-400">
+                    <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse" />
+                    重新分析場上狀態中…
+                  </span>
+                ) : currentStatus ? (
+                  <span className="text-cyan-300">
+                    分析完成 · {currentStatus.label} · {currentStatus.taxiwayId} ·
+                    {' '}{Math.max(0, Math.round((nowTick - currentStatus.at) / 1000))}s 前
+                  </span>
+                ) : (
+                  <span className="text-gray-600">分析完成 · 尚未偵測到動態</span>
+                )}
+              </div>
+              {(seekDebug || Object.keys(runwayDebug).length > 0) && (
+                <div className="mt-1 p-2 rounded border border-gray-800 bg-black/30 font-mono text-[10px] text-gray-500 space-y-1">
+                  {seekDebug && (
+                    <div className="text-gray-600">
+                      跳轉除錯 seekRequestId={seekDebug.seekRequestId} · targetTime={formatTime(seekDebug.targetTime)} ({seekDebug.targetTime.toFixed(3)}s)
+                    </div>
+                  )}
+                  {Object.entries(runwayDebug).map(([taxiwayId, d]) => (
+                    <div key={taxiwayId} className="text-gray-500 space-y-0.5">
+                      <div>
+                        {taxiwayId} · motion={(d.motionScore * 100).toFixed(1)}%/{(d.motionThreshold * 100).toFixed(0)}%
+                        {' '}· Z1={String(d.z1)} Z2={String(d.z2)} Z3={String(d.z3)}
+                      </div>
+                      <div>
+                        Z3.triggered={String(d.z3Triggered)} · Z2.motion={String(d.z2Motion)}
+                        {' '}· runwayHoldingLatched={String(d.runwayHoldingLatched)} · runwayHoldingState={d.runwayHoldingState}
+                      </div>
+                      <div>
+                        candidate={d.candidateEvent} · confirmed={d.confirmedEvent} · animationType={d.animationType}
+                        {' '}· {d.eventReason}
+                      </div>
+                    </div>
+                  ))}
+                  {Object.keys(runwayDebug).length === 0 && <div className="text-gray-600">尚無任何 taxiway 的判定資料</div>}
+                </div>
+              )}
               <div className="flex items-center gap-2 text-gray-400">
                 <span className="text-gray-600 w-24 shrink-0">已觸發次數</span>
                 <span>{triggerCount}</span>

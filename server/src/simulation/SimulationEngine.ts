@@ -21,6 +21,11 @@ export interface DetectionResult {
   confidence: number;
   enteringRunway: boolean;
   detected_at?: string;
+  // Real camera frame (base64 JPEG, optionally a data: URI) captured at the
+  // moment of detection — see DetectorConfig.tsx's incursion-line scanning.
+  // When present, this becomes the event's actual DETECTION_IMAGE instead of
+  // the generated placeholder (see MediaGeneratorService.saveDetectionSnapshot).
+  snapshotBase64?: string;
 }
 
 export interface ScenarioResult {
@@ -146,7 +151,15 @@ class SimulationEngine {
     // Generate media for RED and YELLOW events
     if (severity === 'RED' || severity === 'YELLOW') {
       try {
-        const mediaRecords = mediaGeneratorService.generateEventMedia(event);
+        const hasRealSnapshot = typeof detection.snapshotBase64 === 'string' && detection.snapshotBase64.length > 0;
+        const mediaRecords = mediaGeneratorService.generateEventMedia(event, { skipDetectionImage: hasRealSnapshot });
+        if (hasRealSnapshot) {
+          try {
+            mediaRecords.push(mediaGeneratorService.saveDetectionSnapshot(event, detection.snapshotBase64!));
+          } catch (err) {
+            logger.error('[SIM] Failed to save real detection snapshot, falling back to none:', err);
+          }
+        }
         mediaRecords.forEach((record) => {
           eventService.addMedia(event.id, {
             media_type: record.mediaType,
@@ -156,7 +169,7 @@ class SimulationEngine {
             captured_at: record.capturedAt,
           });
         });
-        actions.push(`生成 ${mediaRecords.length} 個媒體檔案`);
+        actions.push(`生成 ${mediaRecords.length} 個媒體檔案${hasRealSnapshot ? '（含真實偵測截圖）' : ''}`);
 
         eventService.addTimeline(event.id, {
           action_type: 'MEDIA_GENERATED',

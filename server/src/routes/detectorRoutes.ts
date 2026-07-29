@@ -20,7 +20,9 @@ function isRect(value: unknown): value is DetectorRect {
 function isMotionZone(value: unknown): value is DetectorMotionZone {
   if (typeof value !== 'object' || value === null) return false;
   const z = value as Record<string, unknown>;
-  return typeof z.id === 'string' && typeof z.taxiway_id === 'string' && isRect(z.rect);
+  if (typeof z.id !== 'string' || typeof z.taxiway_id !== 'string' || !isRect(z.rect)) return false;
+  if (z.threshold !== undefined && (typeof z.threshold !== 'number' || z.threshold < 0 || z.threshold > 1)) return false;
+  return true;
 }
 
 // Body shape is untrusted input from either the web editor or the Python
@@ -58,6 +60,14 @@ function validateConfigBody(body: unknown): string | null {
     if (!Array.isArray(b.motion_zones) || !b.motion_zones.every(isMotionZone)) {
       return 'motion_zones must be an array of {id, rect, taxiway_id}.';
     }
+  }
+  if (b.motion_threshold !== undefined) {
+    if (typeof b.motion_threshold !== 'number' || b.motion_threshold < 0 || b.motion_threshold > 1) {
+      return 'motion_threshold must be a number between 0 and 1.';
+    }
+  }
+  if (b.incursion_line !== undefined && b.incursion_line !== null && !isMotionZone(b.incursion_line)) {
+    return 'incursion_line must be null or {id, rect, taxiway_id}.';
   }
 
   return null;
@@ -97,6 +107,8 @@ router.put('/config', (req: Request, res: Response) => {
       ? req.body.video_trigger_seconds
       : current.video_trigger_seconds,
     motion_zones: Array.isArray(req.body.motion_zones) ? req.body.motion_zones : current.motion_zones,
+    motion_threshold: typeof req.body.motion_threshold === 'number' ? req.body.motion_threshold : current.motion_threshold,
+    incursion_line: req.body.incursion_line !== undefined ? req.body.incursion_line : current.incursion_line,
   });
 
   res.json({ success: true, data: config });

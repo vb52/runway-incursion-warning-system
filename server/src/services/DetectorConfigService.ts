@@ -19,6 +19,10 @@ const DEFAULT_CONFIG: Omit<DetectorConfig, 'updated_at'> = {
   video_trigger_taxiway_id: '1S',
   video_trigger_seconds: [],
   motion_zones: [],
+  // Matches DetectorConfig.tsx's old DEFAULT_MOTION_THRESHOLD, now that the
+  // value is persisted here instead of local React state.
+  motion_threshold: 0.06,
+  incursion_line: null,
 };
 
 const CONFIG_ROW_ID = 1;

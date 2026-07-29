@@ -171,6 +171,10 @@ export const demoApi = {
     camera_id?: string;
     confidence?: number;
     entering_runway?: boolean;
+    // Real camera frame (base64 JPEG or data: URI) captured at the moment of
+    // detection — see DetectorConfig.tsx's incursion-line scanning. Becomes
+    // the event's real DETECTION_IMAGE instead of the generated placeholder.
+    snapshot_base64?: string;
   }) =>
     apiCall('/demo/detect', {
       method: 'POST',
