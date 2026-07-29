@@ -40,8 +40,11 @@ router.post('/scenarios/:scenarioId/trigger', async (req: Request, res: Response
 
 // POST /api/demo/reset
 router.post('/reset', (_req: Request, res: Response) => {
-  // Stop system
-  systemStateService.stopSystem();
+  // Force-clear system/taxiway state, including any INCURSION_LATCHED
+  // taxiways. stopSystem() would silently refuse to do anything here (see
+  // SystemStateService.forceReset() for why) — this route needs to actually
+  // reset regardless of what state the demo was left in.
+  systemStateService.forceReset();
 
   // Clear all events
   eventService.deleteAllEvents();

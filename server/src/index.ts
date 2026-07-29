@@ -9,6 +9,7 @@ import { initDb } from './database/db';
 import { systemStateService } from './services/SystemStateService';
 import { eventService } from './services/EventService';
 import { vlmService } from './vlm/VlmService';
+import { videoSyncService } from './services/VideoSyncService';
 import { simulationEngine } from './simulation/SimulationEngine';
 import { setupSocketHandlers } from './socket/socketHandlers';
 
@@ -22,6 +23,7 @@ import auditRoutes from './routes/auditRoutes';
 import demoRoutes from './routes/demoRoutes';
 import healthRoutes from './routes/healthRoutes';
 import mediaRoutes from './routes/mediaRoutes';
+import detectorRoutes from './routes/detectorRoutes';
 
 import { logger } from './utils/logger';
 
@@ -74,6 +76,7 @@ async function main() {
   eventService.setSocketIO(io);
   vlmService.setSocketIO(io);
   simulationEngine.setSocketIO(io);
+  videoSyncService.setSocketIO(io);
 
   // Setup socket handlers
   setupSocketHandlers(io);
@@ -91,6 +94,8 @@ async function main() {
   app.use('/api/audit-logs', auditRoutes);
   app.use('/api/demo', demoRoutes);
   app.use('/api/media', mediaRoutes);
+  // RIWS-POC detector integration: web zone/mask editor + Python bridge sync
+  app.use('/api/detector', detectorRoutes);
 
   // API 404 handler
   app.use('/api', (_req, res) => {

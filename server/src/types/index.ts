@@ -229,3 +229,43 @@ export interface EventFilters {
   page?: number;
   pageSize?: number;
 }
+
+// ── Detector config (RIWS-POC integration) ──────────────────────────────────
+// Shared shape between this server, the web "偵測器後台管理" editor, and the
+// Python detector's local layout.json cache (RIWS-POC/src/riws_poc.py).
+// Zone A/B/C are screen regions the YOLO detector watches; they are NOT the
+// same thing as TaxiwayId — a zone is mapped to a taxiway by RIWS-POC's
+// ZONE_TAXIWAY_MAP before it calls POST /api/demo/detect. Coordinates are
+// pixel offsets into a frame of size frame_w x frame_h.
+export type DetectorZoneId = 'A' | 'B' | 'C';
+
+export interface DetectorRect {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+export interface DetectorConfig {
+  frame_w: number;
+  frame_h: number;
+  zones: Record<DetectorZoneId, DetectorRect>;
+  masks: DetectorRect[];
+  // Looping demo camera clip (server/storage/detector/, served at
+  // GET /api/detector/video) stands in for a live feed. DetectorConfig.tsx
+  // reports "a plane appeared" to POST /api/demo/detect (for
+  // video_trigger_taxiway_id) from three independent sources: a client-side
+  // object detector (TensorFlow.js + COCO-SSD), simple frame-diff motion
+  // detection, and operator-marked timestamps (video_trigger_seconds,
+  // seconds into the loop) for when neither automatic method catches it.
+  video_trigger_taxiway_id: string;
+  video_trigger_seconds: number[];
+  // Operator-drawn crop for motion detection (pixel rect in frame_w x
+  // frame_h space, same as zones/masks). null = scan the whole frame. Kept
+  // separate from `zones` — those are RIWS-POC's YOLO regions with their own
+  // taxiway-per-zone semantics; this is a single, purpose-specific crop so
+  // frame-diff motion detection isn't triggered by irrelevant background
+  // movement (clouds, sky, unrelated apron traffic) outside the runway area.
+  motion_region: DetectorRect | null;
+  updated_at: string;
+}

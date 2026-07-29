@@ -6,6 +6,7 @@ import {
   FileText,
   ClipboardList,
   Settings,
+  Crosshair,
   Wifi,
   WifiOff,
 } from 'lucide-react';
@@ -28,11 +29,52 @@ function Clock() {
   );
 }
 
-const navItems = [
-  { to: '/monitor', icon: Radio, label: '即時監控', sublabel: 'Live Monitor' },
-  { to: '/events', icon: AlertTriangle, label: '事件中心', sublabel: 'Event Center' },
-  { to: '/audit', icon: ClipboardList, label: '操作紀錄', sublabel: 'Audit Log' },
-  { to: '/system', icon: Settings, label: '系統狀態', sublabel: 'System Status' },
+interface NavItem {
+  to: string;
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  sublabel: string;
+}
+
+interface NavGroup {
+  title: string;
+  items: NavItem[];
+}
+
+// 左側工具列分成三組，對應這個 repo 目前橫跨兩個系統（主 RIWS 後端 + RIWS-POC
+// 偵測器）之後的權責邊界。之後加新頁面時請對號放進正確的分組，不要圖方便塞
+// 錯地方，不然後面接手的工程師會搞不清楚哪個頁面屬於哪個系統：
+//
+//   1. 主戰情表 — 兩個系統共用的即時操作畫面。目前只有 LiveMonitor；如果
+//      RIWS-POC 之後也要有自己的即時戰情視圖，一樣放這組。
+//   2. RIWS 後台管理 — 主系統（Node/Express + SQLite + Socket.IO，本 repo
+//      server/ 底下那一套狀態機）自己的管理頁面：事件中心、操作紀錄、系統
+//      狀態。這些頁面完全不碰偵測器設定。
+//   3. 偵測器後台管理 — RIWS-POC（Python YOLO 偵測器，獨立 repo）的管理頁
+//      面。目前只有 Zone/Mask 編輯器（DetectorConfig.tsx），資料存在
+//      detector_config 表（server/src/services/DetectorConfigService.ts），
+//      透過 RIWS-POC/src/riws_bridge.py 跟桌面版 Python 程式互相同步。
+const navGroups: NavGroup[] = [
+  {
+    title: '主戰情表',
+    items: [
+      { to: '/monitor', icon: Radio, label: '即時監控', sublabel: 'Live Monitor' },
+    ],
+  },
+  {
+    title: 'RIWS 後台管理',
+    items: [
+      { to: '/events', icon: AlertTriangle, label: '事件中心', sublabel: 'Event Center' },
+      { to: '/audit', icon: ClipboardList, label: '操作紀錄', sublabel: 'Audit Log' },
+      { to: '/system', icon: Settings, label: '系統狀態', sublabel: 'System Status' },
+    ],
+  },
+  {
+    title: '偵測器後台管理',
+    items: [
+      { to: '/detector', icon: Crosshair, label: '偵測器設定', sublabel: 'Detector Config' },
+    ],
+  },
 ];
 
 export function Layout() {
@@ -48,26 +90,35 @@ export function Layout() {
           <div className="text-xs text-gray-500 mt-0.5">RIWS v1.0 DEMO</div>
         </div>
 
-        {/* Navigation */}
-        <nav className="flex-1 p-2 space-y-1">
-          {navItems.map(({ to, icon: Icon, label, sublabel }) => (
-            <NavLink
-              key={to}
-              to={to}
-              className={({ isActive }) =>
-                `flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-sm ${
-                  isActive
-                    ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30'
-                    : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
-                }`
-              }
-            >
-              <Icon className="w-4 h-4 flex-shrink-0" />
-              <div>
-                <div className="font-medium text-xs leading-tight">{label}</div>
-                <div className="text-xs opacity-60 leading-tight">{sublabel}</div>
+        {/* Navigation — grouped by system ownership, see navGroups comment above */}
+        <nav className="flex-1 p-2 space-y-4 overflow-y-auto">
+          {navGroups.map((group) => (
+            <div key={group.title}>
+              <div className="px-3 mb-1 text-[10px] font-semibold text-gray-600 uppercase tracking-wider">
+                {group.title}
               </div>
-            </NavLink>
+              <div className="space-y-1">
+                {group.items.map(({ to, icon: Icon, label, sublabel }) => (
+                  <NavLink
+                    key={to}
+                    to={to}
+                    className={({ isActive }) =>
+                      `flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-sm ${
+                        isActive
+                          ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30'
+                          : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
+                      }`
+                    }
+                  >
+                    <Icon className="w-4 h-4 flex-shrink-0" />
+                    <div>
+                      <div className="font-medium text-xs leading-tight">{label}</div>
+                      <div className="text-xs opacity-60 leading-tight">{sublabel}</div>
+                    </div>
+                  </NavLink>
+                ))}
+              </div>
+            </div>
           ))}
         </nav>
 

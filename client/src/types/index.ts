@@ -156,3 +156,38 @@ export interface ToastMessage {
   message?: string;
   duration?: number;
 }
+
+// ── Detector config (RIWS-POC integration) ──────────────────────────────────
+// Mirrors server/src/types/index.ts. Zone A/B/C are the RIWS-POC detector's
+// screen regions (pixel rects on a frame_w x frame_h frame), NOT TaxiwayId —
+// the Python detector maps zone -> taxiway itself (see RIWS-POC/src/
+// riws_bridge.py ZONE_TAXIWAY_MAP) before calling the main /api/demo/detect
+// endpoint. This page only edits the zone layout, not the mapping.
+export type DetectorZoneId = 'A' | 'B' | 'C';
+
+export interface DetectorRect {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+export interface DetectorConfig {
+  frame_w: number;
+  frame_h: number;
+  zones: Record<DetectorZoneId, DetectorRect>;
+  masks: DetectorRect[];
+  // Looping demo camera clip (GET /api/detector/video) stands in for a live
+  // feed. DetectorConfig.tsx reports "a plane appeared" to
+  // POST /api/demo/detect (for video_trigger_taxiway_id) from three
+  // independent sources: TensorFlow.js + COCO-SSD object detection, simple
+  // frame-diff motion detection, and operator-marked timestamps
+  // (video_trigger_seconds, seconds into the loop).
+  video_trigger_taxiway_id: string;
+  video_trigger_seconds: number[];
+  // Operator-drawn crop for motion detection (pixel rect in frame_w x
+  // frame_h space). null = scan the whole frame. See DetectorConfig.tsx's
+  // motion-region drawing UI.
+  motion_region: DetectorRect | null;
+  updated_at: string;
+}

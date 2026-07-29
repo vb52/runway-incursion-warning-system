@@ -106,6 +106,20 @@ CREATE TABLE IF NOT EXISTS schema_version (
   applied_at TEXT NOT NULL
 )`;
 
+// Single-row table (id is always 1) holding the RIWS-POC detector's zone/mask
+// layout. This is the shared source of truth between the web "偵測器後台管理"
+// editor and the Python detector (see RIWS-POC/src/riws_bridge.py fetch_config /
+// push_config). Stored as one JSON blob rather than normalized columns because
+// the shape (zone count, mask count) is edited freely from the UI and mirrors
+// the POC's own layout.json structure — normalizing it would just add joins
+// with no query benefit, since it's always read/written as a whole document.
+export const CREATE_DETECTOR_CONFIG_TABLE = `
+CREATE TABLE IF NOT EXISTS detector_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  config_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`;
+
 export const ALL_TABLES = [
   CREATE_SCHEMA_VERSION_TABLE,
   CREATE_EVENTS_TABLE,
@@ -113,4 +127,5 @@ export const ALL_TABLES = [
   CREATE_EVENT_MEDIA_TABLE,
   CREATE_AUDIT_LOGS_TABLE,
   CREATE_EVENT_VLM_ANALYSES_TABLE,
+  CREATE_DETECTOR_CONFIG_TABLE,
 ];

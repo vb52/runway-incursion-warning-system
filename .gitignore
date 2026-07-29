@@ -37,3 +37,4 @@ server/storage/riws.db
 server/storage/riws.db-shm
 server/storage/riws.db-wal
 server/storage/events/
+server/storage/detector/

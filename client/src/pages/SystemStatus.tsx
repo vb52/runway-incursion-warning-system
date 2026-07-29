@@ -178,8 +178,8 @@ export function SystemStatus() {
         />
         <StatusCard
           title="VLM 模式"
-          value={process.env.VLM_PROVIDER === 'http' ? 'HTTP' : 'MOCK'}
-          sub="VLM_PROVIDER=mock"
+          value={(vlmHealth as { info?: { mode?: string } } | null)?.info?.mode ?? 'CHECKING...'}
+          sub="伺服器 VLM_PROVIDER 設定值"
           color="blue"
         />
       </div>

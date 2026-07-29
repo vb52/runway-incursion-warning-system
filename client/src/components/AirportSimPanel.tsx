@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useCallback, useState } from 'react';
+import React, { useEffect, useRef, useCallback, useState, forwardRef, useImperativeHandle } from 'react';
 import { TaxiwayState, TaxiwayId } from '../types';
 import { demoApi } from '../services/api';
 
@@ -7,6 +7,11 @@ import { demoApi } from '../services/api';
 const SIM_TX_X = [105, 195, 285, 375, 465, 555];
 const SIMY = { NA: 27, NJ: 110, RC: 130, SJ: 150, SA: 233 } as const;
 const SIM_SPD = { taxi: 0.026, enter: 0.22, takeoff: 0.083, land: 0.028, vacate: 0.22, svc: 0.022 };
+// Only one scripted-fleet vehicle (TEMPLATES) on the field at a time — extra
+// ones stay WAITING (or hold in DONE past their doneTimer) until the slot
+// frees. DEMO START spawns are exempt: that's a deliberate one-off operator
+// action, not ambient traffic.
+const MAX_CONCURRENT_SCRIPTED = 1;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,9 +36,12 @@ interface SimVehicle {
   doneTimer: number;
   startDelay: number;
   incTriggered: boolean;
-  reversing: boolean;
-  reverseProgress: number;
   simState: SimState;
+  // True for vehicles spawned on-demand via the "DEMO START" button (see
+  // spawnDemoVehicle below). These aren't in TEMPLATES, so once DONE they
+  // must be pruned instead of recycled — the scripted-fleet recycle path
+  // looks the vehicle up in TEMPLATES by id and would throw for these.
+  oneShot?: boolean;
 }
 
 interface Template {
@@ -66,7 +74,7 @@ const TEMPLATES: Template[] = [
 function easeOut(t: number) { return 2 * t - t * t; }
 function easeIn(t: number) { return t * t * t; }
 
-function mkVehicle(t: Template, elapsed: number): SimVehicle {
+function mkVehicle(t: Template, elapsed: number, oneShot = false): SimVehicle {
   return {
     id: t.id,
     type: t.type,
@@ -80,9 +88,8 @@ function mkVehicle(t: Template, elapsed: number): SimVehicle {
     doneTimer: 0,
     startDelay: t.startDelay,
     incTriggered: false,
-    reversing: false,
-    reverseProgress: 0,
     simState: elapsed < t.startDelay ? 'WAITING' : 'ACTIVE',
+    oneShot,
   };
 }
 
@@ -95,10 +102,6 @@ function vehicleXY(v: SimVehicle): { x: number; y: number } {
   const eJY = v.exitSide === 'N' ? NJ : SJ;
   const eAY = v.exitSide === 'N' ? NA : SA;
   const p = v.progress;
-
-  if (v.reversing) {
-    return { x, y: jY + (aY - jY) * v.reverseProgress };
-  }
 
   switch (v.phase) {
     case 'TAXI_OUT':     return { x, y: aY + (jY - aY) * Math.min(p, 1) };
@@ -119,7 +122,6 @@ function vehicleXY(v: SimVehicle): { x: number; y: number } {
 }
 
 function vehicleColor(v: SimVehicle): string {
-  if (v.reversing) return '#888';
   if (v.simState === 'INCURSION') return '#FF4444';
   if (v.simState === 'WAITING') return '#444';
   switch (v.phase) {
@@ -130,6 +132,26 @@ function vehicleColor(v: SimVehicle): string {
     case 'TAXI_OUT':     return v.progress > 0.82 ? '#FFBB00' : '#4499FF';
     case 'TAXI_IN':      return '#4499FF';
     default:             return v.type === 'VEHICLE' ? '#AA66FF' : '#4499FF';
+  }
+}
+
+// Heading for the aircraft icon (see renderFrame), in degrees, matching the
+// icon's default orientation of "nose up" (0deg = north). Vehicles use a
+// non-directional car icon, so this is aircraft-only.
+function vehicleRotation(v: SimVehicle): number {
+  switch (v.phase) {
+    case 'TAXI_OUT':
+    case 'AT_JUNCTION':
+    case 'ENTER_RWY':
+      return v.side === 'N' ? 180 : 0; // heading toward the runway centerline
+    case 'TAKEOFF_ROLL':
+    case 'LAND_ROLL':
+      return 90; // heading east along the runway
+    case 'VACATE_RWY':
+    case 'TAXI_IN':
+      return v.exitSide === 'N' ? 0 : 180; // heading away from the runway, back to apron
+    default:
+      return 0;
   }
 }
 
@@ -146,7 +168,18 @@ interface Props {
   isRwyOn: boolean;
 }
 
-export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
+// Exposed to the parent page so a page-level "RESET" control (see
+// LiveMonitor.tsx handleFullReset) can clear the simulation's local vehicle
+// state too — this component's animation state lives entirely in refs here
+// and isn't reachable from outside any other way.
+export interface AirportSimPanelHandle {
+  reset: () => void;
+}
+
+export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function AirportSimPanel(
+  { taxiways, isActive, isRwyOn },
+  ref
+) {
   const svgRef = useRef<SVGSVGElement>(null);
   const vehiclesRef = useRef<SimVehicle[]>([]);
   const taxiwaysRef = useRef<TaxiwayState[]>(taxiways);
@@ -155,6 +188,7 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
   const lastTsRef = useRef(0);
   const elapsedRef = useRef(0);
   const speedRef = useRef(1);
+  const demoCounterRef = useRef(0);
 
   const [running, setRunning] = useState(false);
   const [speed, setSpeed] = useState(1);
@@ -209,8 +243,20 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
         active++;
         const { x, y } = vehicleXY(v);
         const col = vehicleColor(v);
-        const r = v.type === 'VEHICLE' ? 4 : 6;
-        h += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" fill="${col}" opacity="0.9"/>`;
+        const xs = x.toFixed(1), ys = y.toFixed(1);
+        if (v.type === 'VEHICLE') {
+          // Simple car glyph: body + two wheels, no heading (ground vehicles
+          // don't need a directional icon at this scale).
+          h += `<g transform="translate(${xs},${ys})" opacity="0.9">
+            <rect x="-4" y="-2.5" width="8" height="5" rx="1.3" fill="${col}"/>
+            <circle cx="-2.2" cy="2.6" r="1" fill="#111"/>
+            <circle cx="2.2" cy="2.6" r="1" fill="#111"/>
+          </g>`;
+        } else {
+          // Simple dart/paper-plane silhouette, nose pointing "up" (north) by
+          // default, rotated to match direction of travel (vehicleRotation).
+          h += `<path d="M0,-6 L4,4 L0,2 L-4,4 Z" fill="${col}" opacity="0.9" transform="translate(${xs},${ys}) rotate(${vehicleRotation(v)})"/>`;
+        }
         h += `<text x="${(x + 8).toFixed(1)}" y="${(y + 4).toFixed(1)}" fill="${col}" font-size="8" font-family="monospace" opacity="0.65">${v.id}</text>`;
         if (v.simState === 'INCURSION') {
           h += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="13" fill="none" stroke="#FF4444" stroke-width="2" class="sim-ring"/>`;
@@ -226,38 +272,44 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
     const dt = (dtMs / 1000) * spd;
     elapsedRef.current += dtMs * spd;
 
+    // Concurrency gate for the scripted fleet (MAX_CONCURRENT_SCRIPTED) —
+    // recomputed each tick, incremented as vehicles are promoted below so a
+    // single frame can't wait several past the cap. DEMO START (oneShot)
+    // vehicles aren't counted or gated; they're on-demand, not ambient traffic.
+    let scriptedActiveCount = vehiclesRef.current.filter(
+      v => !v.oneShot && (v.simState === 'ACTIVE' || v.simState === 'INCURSION')
+    ).length;
+
     for (const v of vehiclesRef.current) {
       if (v.simState === 'WAITING') {
-        if (elapsedRef.current >= v.startDelay) v.simState = 'ACTIVE';
+        if (elapsedRef.current >= v.startDelay && scriptedActiveCount < MAX_CONCURRENT_SCRIPTED) {
+          v.simState = 'ACTIVE';
+          scriptedActiveCount++;
+        }
         continue;
       }
 
       if (v.simState === 'DONE') {
+        if (v.oneShot) continue; // pruned from the array below, not recycled
         v.doneTimer -= dtMs * spd;
-        if (v.doneTimer <= 0) {
+        if (v.doneTimer <= 0 && scriptedActiveCount < MAX_CONCURRENT_SCRIPTED) {
           const tmpl = TEMPLATES.find(t => t.id === v.id)!;
           const fresh = mkVehicle(tmpl, Infinity); // always ACTIVE when recycling
           fresh.simState = 'ACTIVE';
           Object.assign(v, fresh);
+          scriptedActiveCount++;
         }
         continue;
       }
 
-      // Check if incursion was cleared by operator
+      // Check if incursion was cleared by operator — proceed straight through
+      // onto the runway instead of backing away (no reversing animation).
       if (v.simState === 'INCURSION' && v.phase === 'AT_JUNCTION') {
         const twId = `${v.txIdx + 1}${v.side}` as TaxiwayId;
         if (getTwState(twId) !== 'INCURSION_LATCHED') {
-          v.reversing = true; v.reverseProgress = 0; v.simState = 'ACTIVE';
-        }
-        continue;
-      }
-
-      if (v.reversing) {
-        v.reverseProgress += SIM_SPD.taxi * dt;
-        if (v.reverseProgress >= 1) {
-          v.reversing = false; v.reverseProgress = 0;
-          v.simState = 'DONE'; v.doneTimer = 8000 + Math.random() * 15000;
+          v.simState = 'ACTIVE';
           v.incTriggered = false;
+          v.phase = 'ENTER_RWY'; v.progress = 0;
         }
         continue;
       }
@@ -286,8 +338,9 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
               entering_runway: true,
             }).catch(() => {/* toast shown by socket */});
           } else if (tw !== 'GUARDED' && tw !== 'INCURSION_LATCHED') {
-            // OFF or unknown — back away
-            v.reversing = true; v.reverseProgress = 0;
+            // OFF or unknown state — proceed straight through rather than
+            // turning back (no reversing animation in this simulation).
+            v.phase = 'ENTER_RWY'; v.progress = 0;
           }
           break;
         }
@@ -333,6 +386,12 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
           break;
       }
     }
+
+    // One-shot DEMO START vehicles don't recycle (see DONE handling above) —
+    // drop them once done instead of leaving dead entries in the array.
+    if (vehiclesRef.current.some(v => v.oneShot && v.simState === 'DONE')) {
+      vehiclesRef.current = vehiclesRef.current.filter(v => !(v.oneShot && v.simState === 'DONE'));
+    }
   }, [getTwState]);
 
   const animate = useCallback((ts: number) => {
@@ -352,6 +411,37 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
     rafRef.current = requestAnimationFrame(animate);
   }, [animate]);
 
+  // Manual "DEMO START" spawn: one vehicle/aircraft taxis out from an apron
+  // and holds at the runway junction awaiting authorization — same AT_JUNCTION
+  // logic the scripted fleet uses (see simStep), just triggered on demand
+  // instead of on a fixed timeline. LAND vehicles are excluded — they start
+  // already on the runway, not "coming out of a taxiway".
+  const spawnDemoVehicle = useCallback(() => {
+    const occupied = new Set(
+      vehiclesRef.current
+        .filter(v =>
+          (v.simState === 'ACTIVE' || v.simState === 'INCURSION') &&
+          (v.phase === 'TAXI_OUT' || v.phase === 'AT_JUNCTION'))
+        .map(v => `${v.txIdx}${v.side}`)
+    );
+    const available: { txIdx: number; side: 'N' | 'S' }[] = [];
+    for (let txIdx = 0; txIdx < 6; txIdx++) {
+      for (const side of ['N', 'S'] as const) {
+        if (!occupied.has(`${txIdx}${side}`)) available.push({ txIdx, side });
+      }
+    }
+    if (available.length === 0) return; // every taxiway approach is already occupied
+
+    const slot = available[Math.floor(Math.random() * available.length)];
+    demoCounterRef.current += 1;
+    const type: VehicleType = Math.random() < 0.7 ? 'DEPART' : 'VEHICLE';
+    const tmpl: Template = { id: `D${demoCounterRef.current}`, type, side: slot.side, txIdx: slot.txIdx, startDelay: 0 };
+
+    vehiclesRef.current.push(mkVehicle(tmpl, Infinity, true));
+    renderFrame();
+    if (!isRunningRef.current) startSim();
+  }, [renderFrame, startSim]);
+
   const stopSim = useCallback(() => {
     isRunningRef.current = false;
     setRunning(false);
@@ -362,10 +452,13 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
   const resetSim = useCallback(() => {
     stopSim();
     elapsedRef.current = 0;
+    demoCounterRef.current = 0;
     vehiclesRef.current = TEMPLATES.map(t => mkVehicle(t, 0));
     renderFrame();
     setTrackCount(0);
   }, [stopSim, renderFrame]);
+
+  useImperativeHandle(ref, () => ({ reset: resetSim }), [resetSim]);
 
   useEffect(() => {
     vehiclesRef.current = TEMPLATES.map(t => mkVehicle(t, 0));
@@ -379,7 +472,7 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
   }, [taxiways, running, renderFrame]);
 
   return (
-    <div className="mt-3 rounded-lg border border-[#2a2a2a] bg-[#0e0e0e] overflow-hidden">
+    <div className="rounded-lg border border-[#2a2a2a] bg-[#0e0e0e] overflow-hidden">
       {/* Header bar */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-[#1e1e1e]">
         <div className="flex items-center gap-2">
@@ -392,6 +485,15 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
           <span className="font-mono text-[10px] text-[#444]">{trackCount} 個目標</span>
         </div>
         <div className="flex items-center gap-1.5">
+          <button
+            onClick={spawnDemoVehicle}
+            title="從隨機一條聯絡道放出一台車輛或飛機，滑行到跑道路口停下等授權"
+            className="font-mono text-[10px] px-2.5 py-0.5 rounded border transition-colors"
+            style={{ background: 'rgba(0,204,255,0.08)', borderColor: '#00CCFF', color: '#00CCFF' }}
+          >
+            DEMO START
+          </button>
+          <span className="font-mono text-[10px] text-[#333]">|</span>
           {([['×½', 0.5], ['×1', 1], ['×2', 2]] as [string, number][]).map(([label, val]) => (
             <button
               key={label}
@@ -490,4 +592,4 @@ export function AirportSimPanel({ taxiways, isActive, isRwyOn }: Props) {
       </div>
     </div>
   );
-}
+});

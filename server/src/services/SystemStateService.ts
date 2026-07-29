@@ -106,6 +106,22 @@ class SystemStateService {
     return { success: true };
   }
 
+  // Used by POST /api/demo/reset — an explicit "clear the whole scene" demo
+  // action, distinct from stopSystem(). stopSystem() refuses to run while any
+  // taxiway is INCURSION_LATCHED (that guard protects the normal operator
+  // shutdown flow from accidentally dropping runway protection mid-incursion);
+  // a full reset must be able to force-clear a stuck incursion too, since
+  // that's exactly the moment an operator most needs the reset button to work.
+  forceReset(): void {
+    logger.info('[STM] Force reset (demo)...');
+    this.powerState = 'OFF';
+    this.runwayProtectionState = 'OFF';
+    ALL_TAXIWAY_IDS.forEach((id) => this.taxiways.set(id, 'OFF'));
+    this.startedAt = undefined;
+    this.updatedAt = nowIso();
+    this.emitStateUpdate();
+  }
+
   // ── Runway Protection ──────────────────────────────────────────────────────
 
   enableRunwayProtection(): { success: boolean; error?: string } {

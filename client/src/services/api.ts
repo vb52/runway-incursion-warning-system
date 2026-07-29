@@ -1,6 +1,8 @@
 // API service for RIWS client
 // All API calls go through these helpers
 
+import { DetectorConfig } from '../types';
+
 const BASE_URL = '/api';
 
 async function apiCall<T>(
@@ -177,5 +179,18 @@ export const demoApi = {
   reset: () =>
     apiCall('/demo/reset', {
       method: 'POST',
+    }),
+};
+
+// ── Detector API (RIWS-POC integration) ───────────────────────────────────
+// Reads/writes the zone & mask layout shared with the Python detector.
+// See client/src/pages/DetectorConfig.tsx and RIWS-POC/src/riws_bridge.py.
+
+export const detectorApi = {
+  getConfig: () => apiCall<{ success: boolean; data: DetectorConfig }>('/detector/config'),
+  updateConfig: (config: Omit<DetectorConfig, 'updated_at'>) =>
+    apiCall<{ success: boolean; data: DetectorConfig }>('/detector/config', {
+      method: 'PUT',
+      body: JSON.stringify(config),
     }),
 };

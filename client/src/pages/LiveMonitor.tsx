@@ -1,9 +1,10 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useRef } from 'react';
 import { useAppStore } from '../stores/appStore';
 import { TaxiwayControlState, TaxiwayId, ALL_TAXIWAY_IDS } from '../types';
-import { systemApi, runwayApi, taxiwayApi } from '../services/api';
-import { Volume2, VolumeX } from 'lucide-react';
-import { AirportSimPanel } from '../components/AirportSimPanel';
+import { systemApi, runwayApi, taxiwayApi, demoApi } from '../services/api';
+import { Volume2, VolumeX, RotateCcw, ShieldOff } from 'lucide-react';
+import { AirportSimPanel, AirportSimPanelHandle } from '../components/AirportSimPanel';
+import { VideoFeed } from '../components/VideoFeed';
 
 // ── Colour helpers ─────────────────────────────────────────────────────────────
 
@@ -159,9 +160,18 @@ interface PanelButtonProps {
   color?: 'green' | 'red' | 'yellow' | 'gray';
   size?: 'sm' | 'md' | 'lg';
   disabled?: boolean;
+  // Whether this button represents the system's CURRENT true state (i.e. it
+  // should look like a lit panel lamp), independent of whether it's
+  // clickable right now. Defaults to `!disabled` so call sites that never
+  // set it keep the old behavior. See RWY/STM controls below for why these
+  // must be passed explicitly: "already in that state" (lit) and
+  // "not clickable" (disabled) are opposite conditions for the ON button,
+  // not the same one.
+  active?: boolean;
 }
 
-function PanelButton({ label, onClick, color = 'gray', size = 'md', disabled = false }: PanelButtonProps) {
+function PanelButton({ label, onClick, color = 'gray', size = 'md', disabled = false, active }: PanelButtonProps) {
+  const isLit = active ?? !disabled;
   const c = {
     green:  { bg: '#001a00', border: '#006622', text: '#00FF88', glow: 'rgba(0,255,136,0.3)' },
     red:    { bg: '#1a0000', border: '#660000', text: '#FF4444', glow: 'rgba(255,68,68,0.3)' },
@@ -175,10 +185,10 @@ function PanelButton({ label, onClick, color = 'gray', size = 'md', disabled = f
       onClick={onClick}
       disabled={disabled}
       style={{
-        backgroundColor: disabled ? '#0d0d0d' : c.bg,
-        border: `2px solid ${disabled ? '#2a2a2a' : c.border}`,
-        color: disabled ? '#333' : c.text,
-        boxShadow: disabled ? 'inset 0 2px 4px rgba(0,0,0,0.8)' : `inset 0 2px 4px rgba(0,0,0,0.8), 0 0 8px 1px ${c.glow}`,
+        backgroundColor: isLit ? c.bg : '#0d0d0d',
+        border: `2px solid ${isLit ? c.border : '#2a2a2a'}`,
+        color: isLit ? c.text : '#333',
+        boxShadow: isLit ? `inset 0 2px 4px rgba(0,0,0,0.8), 0 0 8px 1px ${c.glow}` : 'inset 0 2px 4px rgba(0,0,0,0.8)',
         letterSpacing: '0.08em',
       }}
       className={`${sz} rounded font-mono font-bold tracking-widest uppercase transition-all hover:brightness-125 active:scale-95 disabled:cursor-not-allowed`}
@@ -271,6 +281,46 @@ export function LiveMonitor() {
     catch (err) { addToast({ type: 'error', title: 'RWY OFF 失敗', message: err instanceof Error ? err.message : '' }); }
   };
 
+  // Bulk-clears every currently INCURSION_LATCHED taxiway back to GUARDED,
+  // by fanning out to the same POST /api/taxiways/:id/reset each taxiway's
+  // own 復歸 button already calls (SystemStateService.resetTaxiway) — no new
+  // backend endpoint, so the existing per-taxiway safety rule (LATCHED can
+  // only go to GUARDED, never straight to AUTHORIZED) is reused as-is rather
+  // than re-implemented. Unlike RESET (handleFullReset), this doesn't touch
+  // STM/RWY state, events, or the simulation panel — just the alerts.
+  const handleOmitAllIncursions = async () => {
+    const latched = taxiways.filter((t) => t.state === 'INCURSION_LATCHED').map((t) => t.id);
+    if (latched.length === 0) return;
+
+    const results = await Promise.allSettled(latched.map((id) => taxiwayApi.reset(id)));
+    const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+
+    if (succeeded > 0) {
+      addToast({ type: 'success', title: `已忽略 ${succeeded} 個入侵告警`, duration: 2500 });
+    }
+    if (succeeded < latched.length) {
+      addToast({ type: 'error', title: `${latched.length - succeeded} 個復歸失敗`, duration: 3000 });
+    }
+  };
+
+  // Page-level full reset: clears backend state + all events (demoApi.reset,
+  // same endpoint /api/demo/reset already used by Demo scenarios) AND the
+  // ground-simulation panel's local vehicle state, which lives entirely in
+  // AirportSimPanel's own refs and isn't reachable any other way — see
+  // AirportSimPanelHandle.
+  const simPanelRef = useRef<AirportSimPanelHandle>(null);
+
+  const handleFullReset = async () => {
+    if (!window.confirm('確定要清空重置整個場景嗎？這會停止系統、清除所有事件，並重設地面模擬。')) return;
+    try {
+      await demoApi.reset();
+      simPanelRef.current?.reset();
+      addToast({ type: 'success', title: '場景已重置', duration: 2500 });
+    } catch (err) {
+      addToast({ type: 'error', title: '重置失敗', message: err instanceof Error ? err.message : '' });
+    }
+  };
+
   return (
     <div
       className="h-full overflow-y-auto flex flex-col items-center py-4 px-4"
@@ -287,6 +337,26 @@ export function LiveMonitor() {
         }
       `}</style>
 
+      {/* ── Page-level RESET — clears backend state/events + sim panel ──── */}
+      <div className="w-full flex justify-end mb-2" style={{ maxWidth: 1400 }}>
+        <button
+          onClick={handleFullReset}
+          title="停止系統、清除所有事件、重設地面模擬"
+          className="flex items-center gap-1.5 font-mono text-[10px] px-3 py-1 rounded border transition-colors"
+          style={{ background: 'rgba(255,68,68,0.08)', borderColor: '#FF4444', color: '#FF4444' }}
+        >
+          <RotateCcw className="w-3 h-3" />
+          RESET
+        </button>
+      </div>
+
+      {/* ── Left/right layout: control panel left, ground sim right ─────
+          Stacks vertically below the `lg` breakpoint so it doesn't get
+          squeezed on narrow windows — side by side is the point on a normal
+          desktop monitor, not at the cost of unusable narrow layouts. */}
+      <div className="w-full flex flex-col lg:flex-row gap-4 items-start justify-center" style={{ maxWidth: 1400 }}>
+      <div className="flex flex-col items-center" style={{ maxWidth: 680, width: '100%' }}>
+
       {/* ── MAIN PANEL ─────────────────────────────────────────────────── */}
       <div
         style={{
@@ -296,7 +366,6 @@ export function LiveMonitor() {
           padding: '18px 20px',
           boxShadow: '0 0 0 1px #3a3a3a, 0 0 40px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.04)',
           position: 'relative',
-          maxWidth: 680,
           width: '100%',
         }}
       >
@@ -308,6 +377,23 @@ export function LiveMonitor() {
             <line x1="5" y1="3" x2="5" y2="7" stroke="#777" strokeWidth="0.8"/>
           </svg>
         ))}
+
+        {/* Bulk-dismiss all active incursions back to GUARDED — doesn't touch
+            STM/RWY/events/simulation, see handleOmitAllIncursions comment. */}
+        <button
+          onClick={handleOmitAllIncursions}
+          disabled={!hasIncursion}
+          title="忽略場上所有目前的入侵告警，直接復歸為 GUARDED（不影響 STM/RWY/事件記錄）"
+          className="absolute top-2.5 right-7 flex items-center gap-1 px-2 py-1 rounded text-[9px] font-mono font-bold tracking-widest uppercase border transition-all hover:brightness-125 disabled:opacity-30 disabled:cursor-not-allowed"
+          style={{
+            background: hasIncursion ? 'rgba(255,68,68,0.1)' : 'rgba(20,20,20,0.5)',
+            borderColor: hasIncursion ? '#FF4444' : '#2a2a2a',
+            color: hasIncursion ? '#FF4444' : '#555',
+          }}
+        >
+          <ShieldOff className="w-3 h-3" />
+          OMIT
+        </button>
 
         {/* Title */}
         <div className="text-center mb-3">
@@ -400,8 +486,8 @@ export function LiveMonitor() {
           <div className="flex flex-col items-center gap-1.5">
             <span className="font-mono text-[10px] text-[#333] tracking-widest">RWY CONTROL</span>
             <div className="flex gap-2">
-              <PanelButton label="RWY ON"  onClick={handleRwyEnable}  color="yellow" disabled={!isActive || isRwyOn}/>
-              <PanelButton label="RWY OFF" onClick={handleRwyDisable} color="red"    disabled={!isActive || !isRwyOn || hasIncursion}/>
+              <PanelButton label="RWY ON"  onClick={handleRwyEnable}  color="yellow" active={isRwyOn}  disabled={!isActive || isRwyOn}/>
+              <PanelButton label="RWY OFF" onClick={handleRwyDisable} color="red"    active={!isRwyOn} disabled={!isActive || !isRwyOn || hasIncursion}/>
             </div>
           </div>
           <div className="w-px h-10" style={{ background: '#2a2a2a' }}/>
@@ -409,9 +495,9 @@ export function LiveMonitor() {
             <span className="font-mono text-[10px] text-[#333] tracking-widest">STM CONTROL</span>
             <div className="flex gap-2">
               <PanelButton label="STM ON"  onClick={handleSystemStart} color="green" size="lg"
-                disabled={systemState?.powerState === 'ACTIVE' || systemState?.powerState === 'INITIALIZING'}/>
+                active={isActive} disabled={systemState?.powerState === 'ACTIVE' || systemState?.powerState === 'INITIALIZING'}/>
               <PanelButton label="STM OFF" onClick={handleSystemStop}  color="red"   size="lg"
-                disabled={systemState?.powerState === 'OFF' || hasIncursion}/>
+                active={systemState?.powerState === 'OFF'} disabled={systemState?.powerState === 'OFF' || hasIncursion}/>
             </div>
           </div>
         </div>
@@ -429,13 +515,50 @@ export function LiveMonitor() {
         點擊聯絡道：GUARDED → 授權 | AUTHORIZED → 撤銷 | INCURSION → 復歸
       </div>
 
-      {/* ── Airport simulation panel ────────────────────────────────────── */}
-      <div style={{ maxWidth: 680, width: '100%' }}>
+      </div>
+
+      {/* ── Right column: airport simulation panel on top, small camera
+          feed preview below (see AI detection + trigger on /detector page) */}
+      <div style={{ maxWidth: 680, width: '100%' }} className="flex flex-col gap-3">
         <AirportSimPanel
+          ref={simPanelRef}
           taxiways={taxiways}
           isActive={isActive}
           isRwyOn={isRwyOn}
         />
+
+        {/* Status light auto-reflects RWY protection; panel auto-enlarges +
+            goes red-alert while an incursion is active, so the operator's
+            eye is drawn to the camera feed exactly when it matters — then
+            shrinks back once the incursion clears. */}
+        <div
+          className="rounded-lg border overflow-hidden transition-all duration-500"
+          style={{
+            width: hasIncursion ? 620 : 340,
+            borderColor: hasIncursion ? '#FF3333' : '#2a2a2a',
+            boxShadow: hasIncursion ? '0 0 20px 4px rgba(255,51,51,0.4)' : 'none',
+            background: '#0e0e0e',
+          }}
+        >
+          <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#1e1e1e]">
+            <div
+              className={`w-1.5 h-1.5 rounded-full ${hasIncursion ? 'animate-pulse' : ''}`}
+              style={{
+                background: hasIncursion ? '#FF3333' : isRwyOn ? '#FFD700' : '#3a3a3a',
+                boxShadow: hasIncursion ? '0 0 6px #FF3333' : isRwyOn ? '0 0 6px #FFD700' : 'none',
+              }}
+            />
+            <span
+              className="font-mono text-[9px] tracking-widest uppercase"
+              style={{ color: hasIncursion ? '#FF3333' : isRwyOn ? '#FFD700' : '#555' }}
+            >
+              CAM-01 {hasIncursion ? '· INCURSION' : isRwyOn ? '· RWY ON' : '示範影像'}
+            </span>
+          </div>
+          <VideoFeed />
+        </div>
+      </div>
+
       </div>
     </div>
   );

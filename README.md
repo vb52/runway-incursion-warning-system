@@ -18,12 +18,13 @@
 8. [WebSocket 事件](#websocket-事件)
 9. [前端架構](#前端架構)
 10. [機場地面模擬系統](#機場地面模擬系統)
-11. [VLM 視覺語意分析](#vlm-視覺語意分析)
-12. [稽核日誌](#稽核日誌)
-13. [環境變數](#環境變數)
-14. [安全規則（禁止違反）](#安全規則禁止違反)
-15. [Mock vs 正式](#mock-vs-正式)
-16. [部署到正式環境](#部署到正式環境)
+11. [RIWS-POC 偵測器整合](#riws-poc-偵測器整合)
+12. [VLM 視覺語意分析](#vlm-視覺語意分析)
+13. [稽核日誌](#稽核日誌)
+14. [環境變數](#環境變數)
+15. [安全規則（禁止違反）](#安全規則禁止違反)
+16. [Mock vs 正式](#mock-vs-正式)
+17. [部署到正式環境](#部署到正式環境)
 
 ---
 
@@ -177,11 +178,12 @@ RIWS/
 │       ├── hooks/
 │       │   └── useSocket.ts          # ★ WebSocket 事件 → appStore 橋接
 │       ├── pages/
-│       │   ├── LiveMonitor.tsx       # ★ 主控制面板（最重要的頁面）
-│       │   ├── EventCenter.tsx       # 事件列表 + 篩選
-│       │   ├── EventDetail.tsx       # 事件詳情 + VLM 分析結果
-│       │   ├── AuditLog.tsx          # 稽核日誌表格
-│       │   └── SystemStatus.tsx      # 系統健康狀態頁
+│       │   ├── LiveMonitor.tsx       # ★ 主控制面板（最重要的頁面，屬於「主戰情表」分組）
+│       │   ├── EventCenter.tsx       # 事件列表 + 篩選（屬於「RIWS 後台管理」分組）
+│       │   ├── EventDetail.tsx       # 事件詳情 + VLM 分析結果（屬於「RIWS 後台管理」分組）
+│       │   ├── AuditLog.tsx          # 稽核日誌表格（屬於「RIWS 後台管理」分組）
+│       │   ├── SystemStatus.tsx      # 系統健康狀態頁（屬於「RIWS 後台管理」分組）
+│       │   └── DetectorConfig.tsx    # ★ RIWS-POC Zone/Mask 網頁編輯器（屬於「偵測器後台管理」分組，見下方 RIWS-POC 整合章節）
 │       ├── services/
 │       │   ├── api.ts                # ★ 所有 REST API 呼叫函式
 │       │   ├── AudioController.ts    # 語音告警（"Check Runway"）
@@ -209,11 +211,13 @@ RIWS/
 │       │   ├── vlmRoutes.ts          # /api/events/:id/vlm/*
 │       │   ├── vlmHealthRoutes.ts    # /api/vlm/health
 │       │   ├── mediaRoutes.ts        # /api/media/:id
-│       │   └── healthRoutes.ts       # /api/health
+│       │   ├── healthRoutes.ts       # /api/health
+│       │   └── detectorRoutes.ts     # /api/detector/config — RIWS-POC 整合
 │       ├── services/
 │       │   ├── SystemStateService.ts # ★ 系統狀態單例（in-memory）
 │       │   ├── EventService.ts       # ★ 事件 CRUD（SQLite）
-│       │   └── AuditService.ts       # 稽核日誌寫入（SQLite，只寫不刪）
+│       │   ├── AuditService.ts       # 稽核日誌寫入（SQLite，只寫不刪）
+│       │   └── DetectorConfigService.ts # RIWS-POC Zone/Mask 設定讀寫（SQLite，單行 JSON blob）
 │       ├── simulation/
 │       │   └── SimulationEngine.ts   # ★ Demo 規則引擎 + 預設情境
 │       ├── socket/
@@ -368,6 +372,15 @@ FAULT：攝影機異常時進入此狀態
 | `vlm-fail` | VLM 分析失敗情境 |
 | `system-reset` | 全部重設 |
 
+### 偵測器設定（RIWS-POC 整合）
+
+| Method | Path | 說明 |
+|--------|------|------|
+| `GET` | `/api/detector/config` | 取得目前的 Zone A/B/C + Mask 設定 |
+| `PUT` | `/api/detector/config` | 更新 Zone/Mask 設定（`{ frame_w, frame_h, zones, masks }`） |
+
+這兩支 API 是 client 的「偵測器後台管理 → 偵測器設定」頁面（`DetectorConfig.tsx`）與 RIWS-POC（Python 偵測器，另一個獨立 repo）共用的設定同步點，詳見下方「[RIWS-POC 偵測器整合](#riws-poc-偵測器整合)」章節。
+
 ### 稽核日誌
 
 | Method | Path | 說明 |
@@ -454,7 +467,13 @@ export const myApi = {
 
 ### 頁面導覽
 
-`Layout.tsx` 提供側邊欄，點擊時透過 React state 切換顯示的頁面組件（非 React Router，單頁切換）。
+`Layout.tsx` 提供左側工具列（react-router-dom 的 `NavLink`/`Outlet`，不是純 state 切換），分成三個群組，對應目前這個 repo 橫跨的兩個系統：
+
+1. **主戰情表** — 兩個系統共用的即時操作畫面，目前只有 `LiveMonitor`。
+2. **RIWS 後台管理** — 主系統（本 repo `server/`）自己的管理頁面：事件中心、操作紀錄、系統狀態。
+3. **偵測器後台管理** — RIWS-POC（Python YOLO 偵測器，獨立 repo）的管理頁面，目前只有 `DetectorConfig.tsx`。
+
+新增頁面時請對號放進正確分組（`Layout.tsx` 裡的 `navGroups` 常數有詳細註解），不要因為省事就塞錯地方。
 
 ---
 
@@ -502,6 +521,33 @@ const SIM_SPD = {
   svc: 0.022,     // 1/0.022 ≈ 45 秒車輛行駛
 };
 ```
+
+---
+
+## RIWS-POC 偵測器整合
+
+`runway-incursion-warning-system`（本 repo，操作員介面 + 狀態機）與 `RIWS-POC`（獨立 repo，Python + YOLOv8 即時偵測器，吃 YouTube 直播串流）是兩個分開開發、分開部署的專案，透過 HTTP 串接：
+
+```
+RIWS-POC (Python, 獨立進程/獨立機器亦可)
+  ├─ src/riws_poc.py     — YOLO + 背景消去偵測迴圈，桌面 OpenCV 視窗
+  └─ src/riws_bridge.py  — 對本系統的 HTTP client
+        │
+        │ POST /api/demo/detect      （偵測觸發，30 秒/聯絡道防洗版）
+        │ GET/PUT /api/detector/config （Zone/Mask 設定同步）
+        ▼
+RIWS (本 repo, Node/Express + SQLite)
+  ├─ server/src/routes/demoRoutes.ts     — 既有端點，未改動，繼續吃 AirportSimPanel 的模擬輸入
+  ├─ server/src/routes/detectorRoutes.ts — 新增，Zone/Mask 設定的唯一資料來源
+  └─ client/src/pages/DetectorConfig.tsx — 網頁版 Zone/Mask 編輯器（左側工具列「偵測器後台管理」）
+```
+
+**關鍵設計決定**：
+
+- **Zone ≠ Taxiway**：RIWS-POC 的 Zone A/B/C 是任意畫面區域，跟本系統虛構的 12 條聯絡道（1N-6N/1S-6S）沒有物理對應。映射寫死在 `RIWS-POC/src/riws_bridge.py` 的 `ZONE_TAXIWAY_MAP`（預設 `A→1N, B→3S, C→5N`），純粹是 demo 情境設定，改 dict 即可調整。
+- **主系統是設定的唯一真相來源**：Zone/Mask 設定存在本系統的 `detector_config` SQLite 表（`DetectorConfigService.ts`）。RIWS-POC 啟動時用 `fetch_config()` 讀取，桌面端存檔時用 `push_config()` 寫回；本機 `output/layout.json` 只是離線備援快取。兩邊都能編輯，後存的會覆蓋前者，沒有欄位級合併。
+- **完全選配、互不阻塞**：這兩個 repo 各自能獨立運作。RIWS-POC 連不到本系統時，`riws_bridge.py` 只印一次警告然後繼續用本機快取；本系統開發/測試時完全不需要 RIWS-POC 在跑，`AirportSimPanel` 的模擬輸入路徑沒有任何改動。
+- **既有安全規則沒有被繞過**：`POST /api/demo/detect` 仍然要求 STM ACTIVE + RWY 保護 ON 才會處理偵測（見下方安全規則章節），`riws_bridge.py` 不會、也不能繞過這個檢查。
 
 ---
 
@@ -621,7 +667,7 @@ INCURSION_FLASH_MODE=steady
 
 | 功能 | 目前狀態（Mock） | 接正式的步驟 |
 |------|----------------|-------------|
-| **感測器輸入** | `AirportSimPanel` 前端模擬 + `demoApi.detect()` | 真實感測器呼叫 `POST /api/demo/detect`（同樣的入口），或直接呼叫 `SimulationEngine.processDetection()` |
+| **感測器輸入** | `AirportSimPanel` 前端模擬 + `demoApi.detect()` | 已有選配的真實路徑：`RIWS-POC`（獨立 repo，YOLOv8 偵測器）透過 `riws_bridge.py` 呼叫同一個 `POST /api/demo/detect`，見「[RIWS-POC 偵測器整合](#riws-poc-偵測器整合)」。要接其他硬體感測器一樣呼叫這個入口，或直接呼叫 `SimulationEngine.processDetection()` |
 | **影像/影片** | `MediaGeneratorService` 生成 placeholder 圖片 | 替換 `MediaGeneratorService` 邏輯，儲存真實 CCTV 截圖 |
 | **VLM 分析** | `MockVlmProvider` 回傳假結果 | 設定 `VLM_PROVIDER=http` + 填入 `VLM_API_URL` / `VLM_API_KEY` |
 | **操作員身份** | 硬寫 `'ATC-01'` / `'OPR-001'` | 接入 JWT/Session 認證，從 token 取得操作員 ID |
