@@ -1,10 +1,11 @@
-import React, { useCallback, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../stores/appStore';
 import { TaxiwayControlState, TaxiwayId, ALL_TAXIWAY_IDS } from '../types';
 import { systemApi, runwayApi, taxiwayApi, demoApi } from '../services/api';
 import { Volume2, VolumeX, RotateCcw, ShieldOff } from 'lucide-react';
 import { AirportSimPanel, AirportSimPanelHandle } from '../components/AirportSimPanel';
 import { VideoFeed } from '../components/VideoFeed';
+import { useDetectorAlert } from '../hooks/useDetectorAlert';
 
 // ── Colour helpers ─────────────────────────────────────────────────────────────
 
@@ -235,6 +236,21 @@ export function LiveMonitor() {
   const isActive = systemState?.powerState === 'ACTIVE';
   const isRwyOn = systemState?.runwayProtectionState === 'ON';
   const rwyOff = isActive && !isRwyOn;
+
+  // Detector's runway auto-alert countdown (armed from /detector's AI/motion/
+  // manual detections) — server-synced via useDetectorAlert so it shows the
+  // same countdown regardless of which page armed it.
+  const alertUntil = useDetectorAlert();
+  const [nowTick, setNowTick] = useState(Date.now());
+  // 200ms (not 1000ms) so this page's countdown display doesn't drift up to
+  // a full second out of phase with DetectorConfig.tsx's — see the matching
+  // comment there. Both read the exact same alertUntil; only the local
+  // sampling rate differed.
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 200);
+    return () => clearInterval(id);
+  }, []);
+  const alertSecondsLeft = alertUntil ? Math.max(0, Math.ceil((alertUntil - nowTick) / 1000)) : 0;
 
   const getTwState = (id: TaxiwayId): TaxiwayControlState =>
     taxiways.find(t => t.id === id)?.state ?? 'OFF';
@@ -554,6 +570,12 @@ export function LiveMonitor() {
             >
               CAM-01 {hasIncursion ? '· INCURSION' : isRwyOn ? '· RWY ON' : '示範影像'}
             </span>
+            {alertSecondsLeft > 0 && (
+              <span className="ml-auto flex items-center gap-1 font-mono text-[9px] text-yellow-400">
+                <span className="w-1 h-1 rounded-full bg-yellow-400 animate-pulse" />
+                偵測器警戒中 · {alertSecondsLeft}s
+              </span>
+            )}
           </div>
           <VideoFeed />
         </div>

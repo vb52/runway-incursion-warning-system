@@ -185,9 +185,19 @@ export interface DetectorConfig {
   // (video_trigger_seconds, seconds into the loop).
   video_trigger_taxiway_id: string;
   video_trigger_seconds: number[];
-  // Operator-drawn crop for motion detection (pixel rect in frame_w x
-  // frame_h space). null = scan the whole frame. See DetectorConfig.tsx's
-  // motion-region drawing UI.
-  motion_region: DetectorRect | null;
+  // Operator-drawn motion-detection zones (pixel rects in frame_w x frame_h
+  // space, same as zones/masks). Each zone is independently frame-diffed and
+  // maps to its own taxiway, so e.g. Z1 over one taxiway mouth and Z2 over
+  // another each report to the right taxiway instead of everything funneling
+  // through one shared video_trigger_taxiway_id. Empty array = no motion
+  // zones configured (motion detection has nothing to scan). See
+  // DetectorConfig.tsx's zone drawing UI.
+  motion_zones: DetectorMotionZone[];
   updated_at: string;
+}
+
+export interface DetectorMotionZone {
+  id: string; // e.g. 'Z1', 'Z2' — display label, also the frame-diff baseline's cache key
+  rect: DetectorRect;
+  taxiway_id: string;
 }

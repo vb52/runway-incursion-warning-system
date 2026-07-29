@@ -193,4 +193,16 @@ export const detectorApi = {
       method: 'PUT',
       body: JSON.stringify(config),
     }),
+  // Arms (or extends) the server-owned runway auto-alert window — see
+  // DetectorAlertService. Broadcasts 'detector:alert-armed' to all clients.
+  armAlert: (durationMs: number) =>
+    apiCall<{ success: boolean; data: { alertUntil: number | null } }>('/detector/alert/arm', {
+      method: 'POST',
+      body: JSON.stringify({ duration_ms: durationMs }),
+    }),
+  // Manual early-clear of the alert window — see DetectorAlertService.clear().
+  clearAlert: () =>
+    apiCall<{ success: boolean; data: { alertUntil: number | null } }>('/detector/alert/clear', {
+      method: 'POST',
+    }),
 };

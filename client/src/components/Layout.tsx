@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { NavLink, Outlet } from 'react-router-dom';
+import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import {
   Radio,
   AlertTriangle,
@@ -13,6 +13,8 @@ import {
 import { useAppStore } from '../stores/appStore';
 import { ToastContainer } from './Toast';
 import { formatDisplay } from '../utils/datetime';
+import { LiveMonitor } from '../pages/LiveMonitor';
+import { DetectorConfigPage } from '../pages/DetectorConfig';
 
 function Clock() {
   const [time, setTime] = useState(() => formatDisplay(new Date().toISOString()));
@@ -79,6 +81,18 @@ const navGroups: NavGroup[] = [
 
 export function Layout() {
   const { state } = useAppStore();
+  const location = useLocation();
+  // LiveMonitor and DetectorConfigPage are rendered here directly (see
+  // main.tsx's comment) rather than via <Outlet/>, always mounted for the
+  // life of the app and just shown/hidden by CSS depending on the route.
+  // The reason is DetectorConfigPage: its AI/motion/manual detection
+  // setInterval loops (client/src/pages/DetectorConfig.tsx) must keep
+  // running when the operator switches to another page — a real detector
+  // doesn't stop watching the runway just because someone looked away from
+  // its settings screen. A normal <Route>-driven unmount would clearInterval
+  // every one of those loops the instant you navigated off /detector.
+  const isMonitor = location.pathname === '/' || location.pathname === '/monitor';
+  const isDetector = location.pathname === '/detector';
 
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100 overflow-hidden">
@@ -170,6 +184,15 @@ export function Layout() {
 
         {/* Page Content */}
         <main className="flex-1 overflow-auto">
+          {/* Always mounted, CSS-toggled — see the comment on isMonitor/
+              isDetector above for why. */}
+          <div className="h-full" style={{ display: isMonitor ? 'block' : 'none' }}>
+            <LiveMonitor />
+          </div>
+          <div className="h-full overflow-auto" style={{ display: isDetector ? 'block' : 'none' }}>
+            <DetectorConfigPage />
+          </div>
+          {/* Every other page still uses normal route-driven mount/unmount. */}
           <Outlet />
         </main>
       </div>

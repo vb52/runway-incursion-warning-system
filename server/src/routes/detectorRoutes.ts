@@ -2,7 +2,8 @@ import { Router, Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import { detectorConfigService } from '../services/DetectorConfigService';
-import { DetectorRect, DetectorZoneId } from '../types';
+import { detectorAlertService } from '../services/DetectorAlertService';
+import { DetectorRect, DetectorZoneId, DetectorMotionZone } from '../types';
 
 const router = Router();
 
@@ -14,6 +15,12 @@ function isRect(value: unknown): value is DetectorRect {
   if (typeof value !== 'object' || value === null) return false;
   const r = value as Record<string, unknown>;
   return ['x1', 'y1', 'x2', 'y2'].every((k) => typeof r[k] === 'number');
+}
+
+function isMotionZone(value: unknown): value is DetectorMotionZone {
+  if (typeof value !== 'object' || value === null) return false;
+  const z = value as Record<string, unknown>;
+  return typeof z.id === 'string' && typeof z.taxiway_id === 'string' && isRect(z.rect);
 }
 
 // Body shape is untrusted input from either the web editor or the Python
@@ -47,8 +54,10 @@ function validateConfigBody(body: unknown): string | null {
       return 'video_trigger_seconds must be an array of numbers.';
     }
   }
-  if (b.motion_region !== undefined && b.motion_region !== null && !isRect(b.motion_region)) {
-    return 'motion_region must be null or a rect {x1,y1,x2,y2}.';
+  if (b.motion_zones !== undefined) {
+    if (!Array.isArray(b.motion_zones) || !b.motion_zones.every(isMotionZone)) {
+      return 'motion_zones must be an array of {id, rect, taxiway_id}.';
+    }
   }
 
   return null;
@@ -87,9 +96,7 @@ router.put('/config', (req: Request, res: Response) => {
     video_trigger_seconds: Array.isArray(req.body.video_trigger_seconds)
       ? req.body.video_trigger_seconds
       : current.video_trigger_seconds,
-    // Explicit `null` (clear the region) is distinct from "not sent" — only
-    // fall back to current when the field is fully absent from the body.
-    motion_region: req.body.motion_region !== undefined ? req.body.motion_region : current.motion_region,
+    motion_zones: Array.isArray(req.body.motion_zones) ? req.body.motion_zones : current.motion_zones,
   });
 
   res.json({ success: true, data: config });
@@ -107,6 +114,29 @@ router.get('/video', (_req: Request, res: Response) => {
     return res.status(404).json({ success: false, error: 'Detector video not found.' });
   }
   res.sendFile(VIDEO_PATH);
+});
+
+// POST /api/detector/alert/arm
+// Called by DetectorConfig.tsx whenever any of its 3 detection sources
+// (AI/motion/manual) reports a plane. See DetectorAlertService — arming (or
+// extending) broadcasts to every connected client via Socket.IO
+// ('detector:alert-armed'/'detector:alert-cleared') so LiveMonitor's
+// countdown matches the detector page's, not just whichever tab armed it.
+router.post('/alert/arm', async (req: Request, res: Response) => {
+  const durationMs = req.body?.duration_ms;
+  if (typeof durationMs !== 'number' || durationMs <= 0) {
+    return res.status(400).json({ success: false, error: 'duration_ms must be a positive number.' });
+  }
+  await detectorAlertService.arm(durationMs);
+  res.json({ success: true, data: detectorAlertService.getState() });
+});
+
+// POST /api/detector/alert/clear
+// Manual early-clear — DetectorConfig.tsx's "RESET" button. Ends the alert
+// window immediately instead of waiting for it to expire on its own.
+router.post('/alert/clear', (_req: Request, res: Response) => {
+  detectorAlertService.clear();
+  res.json({ success: true, data: detectorAlertService.getState() });
 });
 
 export default router;

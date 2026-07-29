@@ -260,12 +260,21 @@ export interface DetectorConfig {
   // seconds into the loop) for when neither automatic method catches it.
   video_trigger_taxiway_id: string;
   video_trigger_seconds: number[];
-  // Operator-drawn crop for motion detection (pixel rect in frame_w x
-  // frame_h space, same as zones/masks). null = scan the whole frame. Kept
-  // separate from `zones` — those are RIWS-POC's YOLO regions with their own
-  // taxiway-per-zone semantics; this is a single, purpose-specific crop so
-  // frame-diff motion detection isn't triggered by irrelevant background
-  // movement (clouds, sky, unrelated apron traffic) outside the runway area.
-  motion_region: DetectorRect | null;
+  // Operator-drawn motion-detection zones (pixel rects in frame_w x frame_h
+  // space, same as zones/masks) — replaces the old single motion_region.
+  // Each zone is independently frame-diffed and maps to its own taxiway, so
+  // e.g. Z1 over one taxiway mouth and Z2 over another each report to the
+  // right POST /api/demo/detect target instead of everything funneling
+  // through one shared video_trigger_taxiway_id. Kept separate from `zones`
+  // — those are RIWS-POC's YOLO regions, a different pipeline entirely.
+  // Empty array = no motion zones configured (motion detection has nothing
+  // to scan).
+  motion_zones: DetectorMotionZone[];
   updated_at: string;
+}
+
+export interface DetectorMotionZone {
+  id: string; // e.g. 'Z1', 'Z2' — display label, also the frame-diff baseline's cache key
+  rect: DetectorRect;
+  taxiway_id: string;
 }

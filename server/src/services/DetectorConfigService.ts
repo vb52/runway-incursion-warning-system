@@ -18,7 +18,7 @@ const DEFAULT_CONFIG: Omit<DetectorConfig, 'updated_at'> = {
   masks: [],
   video_trigger_taxiway_id: '1S',
   video_trigger_seconds: [],
-  motion_region: null,
+  motion_zones: [],
 };
 
 const CONFIG_ROW_ID = 1;

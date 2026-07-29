@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useVideoSync } from '../hooks/useVideoSync';
 
 // Loop preview of the detector's demo camera clip (GET /api/detector/video,
@@ -21,10 +21,16 @@ function formatTime(s: number): string {
 
 export function VideoFeed({ className }: { className?: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const { publish } = useVideoSync(videoRef);
+  const { publish, debug: syncDebug } = useVideoSync(videoRef);
   const [playbackRate, setPlaybackRate] = useState(3);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  const [nowTick, setNowTick] = useState(Date.now());
+
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const applyRate = (rate: number) => {
     setPlaybackRate(rate);
@@ -92,6 +98,17 @@ export function VideoFeed({ className }: { className?: string }) {
               </button>
             ))}
           </div>
+        </div>
+        <div className="mt-1 font-mono text-[9px] text-gray-600">
+          同步：{syncDebug.connected ? <span className="text-green-500">連線中</span> : <span className="text-red-500">未連線</span>}
+          {' · '}
+          {syncDebug.lastSyncAt
+            ? `${Math.max(0, Math.round((nowTick - syncDebug.lastSyncAt) / 1000))}s 前`
+            : '尚未收到'}
+          {' · '}
+          <span style={{ color: Math.abs(syncDebug.driftS) > 0.15 ? '#ff4444' : '#00ff88' }}>
+            {syncDebug.driftS >= 0 ? '+' : ''}{syncDebug.driftS.toFixed(2)}s
+          </span>
         </div>
       </div>
     </div>

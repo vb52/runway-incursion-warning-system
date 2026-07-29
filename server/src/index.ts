@@ -10,6 +10,7 @@ import { systemStateService } from './services/SystemStateService';
 import { eventService } from './services/EventService';
 import { vlmService } from './vlm/VlmService';
 import { videoSyncService } from './services/VideoSyncService';
+import { detectorAlertService } from './services/DetectorAlertService';
 import { simulationEngine } from './simulation/SimulationEngine';
 import { setupSocketHandlers } from './socket/socketHandlers';
 
@@ -77,6 +78,7 @@ async function main() {
   vlmService.setSocketIO(io);
   simulationEngine.setSocketIO(io);
   videoSyncService.setSocketIO(io);
+  detectorAlertService.setSocketIO(io);
 
   // Setup socket handlers
   setupSocketHandlers(io);

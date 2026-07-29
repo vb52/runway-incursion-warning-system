@@ -1,4 +1,4 @@
-import { RefObject, useCallback, useEffect, useRef } from 'react';
+import { RefObject, useCallback, useEffect, useRef, useState } from 'react';
 import { getSocket } from '../services/socketService';
 
 // Keeps a <video> element's playbackRate/currentTime in step with every
@@ -14,30 +14,47 @@ interface VideoSyncState {
   epochTime: number;
 }
 
-const DRIFT_CORRECTION_THRESHOLD_S = 0.5; // only hard-seek past this, so small jitter doesn't stutter playback
+export interface VideoSyncDebug {
+  connected: boolean;
+  lastSyncAt: number | null; // Date.now() ms of the last *received* (not self-check) sync event
+  driftS: number; // currentTime - expected, as of the last check (before correction)
+}
+
+const DRIFT_CORRECTION_THRESHOLD_S = 0.15; // only hard-seek past this, so small jitter doesn't stutter playback
+const RECHECK_INTERVAL_MS = 1000;
 
 export function useVideoSync(videoRef: RefObject<HTMLVideoElement>) {
   const stateRef = useRef<VideoSyncState | null>(null);
+  const [debug, setDebug] = useState<VideoSyncDebug>({ connected: false, lastSyncAt: null, driftS: 0 });
 
   useEffect(() => {
     const socket = getSocket();
     const video = videoRef.current;
+    let lastSyncAt: number | null = null;
 
     const applyState = (s: VideoSyncState) => {
       stateRef.current = s;
       const v = videoRef.current;
-      if (!v) return;
-      v.playbackRate = s.playbackRate;
-      const duration = v.duration;
-      if (!duration || !isFinite(duration)) return; // metadata not loaded yet — loadedmetadata listener below retries
-      const elapsed = ((Date.now() - s.epochTime) / 1000) * s.playbackRate;
-      const expected = (((s.epochPosition + elapsed) % duration) + duration) % duration;
-      if (Math.abs(v.currentTime - expected) > DRIFT_CORRECTION_THRESHOLD_S) {
-        v.currentTime = expected;
+      let driftS = 0;
+      if (v) {
+        v.playbackRate = s.playbackRate;
+        const duration = v.duration;
+        if (duration && isFinite(duration)) {
+          const elapsed = ((Date.now() - s.epochTime) / 1000) * s.playbackRate;
+          const expected = (((s.epochPosition + elapsed) % duration) + duration) % duration;
+          driftS = v.currentTime - expected;
+          if (Math.abs(driftS) > DRIFT_CORRECTION_THRESHOLD_S) {
+            v.currentTime = expected;
+          }
+        }
       }
+      setDebug({ connected: socket.connected, lastSyncAt, driftS });
     };
 
-    const onSync = (s: VideoSyncState) => applyState(s);
+    const onSync = (s: VideoSyncState) => {
+      lastSyncAt = Date.now();
+      applyState(s);
+    };
     const onLoadedMetadata = () => { if (stateRef.current) applyState(stateRef.current); };
 
     socket.on('video:sync', onSync);
@@ -48,7 +65,7 @@ export function useVideoSync(videoRef: RefObject<HTMLVideoElement>) {
     // line if it's drifted (buffering stalls, background-tab throttling).
     const driftInterval = setInterval(() => {
       if (stateRef.current) applyState(stateRef.current);
-    }, 5000);
+    }, RECHECK_INTERVAL_MS);
 
     return () => {
       socket.off('video:sync', onSync);
@@ -63,5 +80,5 @@ export function useVideoSync(videoRef: RefObject<HTMLVideoElement>) {
     getSocket().emit('video:update', { playbackRate, currentTime });
   }, []);
 
-  return { publish };
+  return { publish, debug };
 }
