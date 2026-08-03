@@ -1,4 +1,4 @@
-// Lets VideoFeed (LiveMonitor's camera preview) mirror DetectorConfig.tsx's
+// Lets VideoFeed (LiveMonitor's camera preview) mirror ZoneConfig.tsx's
 // <video> element via canvas instead of owning a second independent decode
 // of the same ~330MB source. Before this, both pages ran their own <video>
 // at once whenever the operator was actually on 主戰情表 (the page this

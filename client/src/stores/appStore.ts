@@ -15,6 +15,16 @@ interface AppState {
   isConnected: boolean;
   audioEnabled: boolean;
   toasts: ToastMessage[];
+  // AirportSimPanel's "LIVE" toggle — lifted here (rather than kept as that
+  // component's own local useState) so ZoneConfig.tsx's detection tick loop
+  // can read it too: real detections must not auto-arm runway protection
+  // while LIVE is off (operator explicitly asked for this — previously the
+  // alert/RWY pipeline ran unconditionally regardless of this switch, only
+  // the ground-sim projection was gated by it). Both components are
+  // descendants of the same AppProvider, so plain Context state is enough —
+  // this is same-tab UI state, not something that needs Socket.IO to sync
+  // across different browser tabs/devices (it never was before either).
+  liveEnabled: boolean;
 }
 
 type AppAction =
@@ -25,6 +35,7 @@ type AppAction =
   | { type: 'UPDATE_EVENT'; payload: RiwsEvent }
   | { type: 'SET_CONNECTED'; payload: boolean }
   | { type: 'SET_AUDIO_ENABLED'; payload: boolean }
+  | { type: 'SET_LIVE_ENABLED'; payload: boolean }
   | { type: 'ADD_TOAST'; payload: ToastMessage }
   | { type: 'REMOVE_TOAST'; payload: string };
 
@@ -67,6 +78,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
     case 'SET_AUDIO_ENABLED':
       return { ...state, audioEnabled: action.payload };
 
+    case 'SET_LIVE_ENABLED':
+      return { ...state, liveEnabled: action.payload };
+
     case 'ADD_TOAST':
       return { ...state, toasts: [...state.toasts, action.payload] };
 
@@ -84,6 +98,7 @@ const initialState: AppState = {
   isConnected: false,
   audioEnabled: true,
   toasts: [],
+  liveEnabled: false,
 };
 
 interface AppContextValue {

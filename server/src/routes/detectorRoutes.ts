@@ -129,17 +129,21 @@ router.get('/video', (_req: Request, res: Response) => {
 });
 
 // POST /api/detector/alert/arm
-// Called by DetectorConfig.tsx whenever any of its 3 detection sources
+// Called by ZoneConfig.tsx whenever any of its detection sources
 // (AI/motion/manual) reports a plane. See DetectorAlertService — arming (or
 // extending) broadcasts to every connected client via Socket.IO
 // ('detector:alert-armed'/'detector:alert-cleared') so LiveMonitor's
 // countdown matches the detector page's, not just whichever tab armed it.
+// may_create (optional, default true) — false for ZoneConfig.tsx's Z2/Z3
+// motion-zone hits: only Z1 may start a brand-new alert, Z2/Z3 may only
+// extend one Z1 already started (see DetectorAlertService.arm's comment).
 router.post('/alert/arm', async (req: Request, res: Response) => {
   const durationMs = req.body?.duration_ms;
   if (typeof durationMs !== 'number' || durationMs <= 0) {
     return res.status(400).json({ success: false, error: 'duration_ms must be a positive number.' });
   }
-  await detectorAlertService.arm(durationMs);
+  const mayCreate = req.body?.may_create !== false;
+  await detectorAlertService.arm(durationMs, mayCreate);
   res.json({ success: true, data: detectorAlertService.getState() });
 });
 

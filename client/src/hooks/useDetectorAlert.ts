@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { getSocket } from '../services/socketService';
 
 // Server-owned "runway auto-alert window" armed by the video detector's 3
-// detection sources (client/src/pages/DetectorConfig.tsx) via
+// detection sources (client/src/pages/ZoneConfig.tsx) via
 // POST /api/detector/alert/arm — see server/src/services/
 // DetectorAlertService.ts. Broadcast via Socket.IO so every page (the
 // detector's own countdown, LiveMonitor's VideoFeed) shows the same

@@ -244,7 +244,7 @@ export function LiveMonitor() {
   const alertUntil = useDetectorAlert();
   const [nowTick, setNowTick] = useState(Date.now());
   // 200ms (not 1000ms) so this page's countdown display doesn't drift up to
-  // a full second out of phase with DetectorConfig.tsx's — see the matching
+  // a full second out of phase with ZoneConfig.tsx's — see the matching
   // comment there. Both read the exact same alertUntil; only the local
   // sampling rate differed.
   useEffect(() => {
@@ -327,14 +327,14 @@ export function LiveMonitor() {
   // AirportSimPanelHandle.
   const simPanelRef = useRef<AirportSimPanelHandle>(null);
 
-  // DetectorConfig.tsx's motion tick loop reports an already-CONFIRMED
-  // runway event ("plane at taxiway X is now doing Y" — see that file's
-  // determineRunwayEvent + consecutive-tick confirmation) via this socket
-  // event — spawn/advance a matching vehicle in the ground-sim diagram so
-  // the real video detection is visibly tied to a specific spot in the
-  // simulation instead of the two staying disconnected. Works regardless of
-  // which page is currently visible, same as the detection loops themselves
-  // (see Layout.tsx's always-mounted LiveMonitor/DetectorConfigPage).
+  // ZoneConfig.tsx's motion tick loop reports a taxiway's aircraft event
+  // state machine advancing ("plane at taxiway X is now doing Y" — see that
+  // file's activeAircraftEventsRef) via this socket event — spawn/advance a
+  // matching vehicle in the ground-sim diagram so the real video detection
+  // is visibly tied to a specific spot in the simulation instead of the two
+  // staying disconnected. Works regardless of which page is currently
+  // visible, same as the detection loops themselves (see Layout.tsx's
+  // always-mounted LiveMonitor/ZoneConfigPage).
   useEffect(() => {
     const socket = getSocket();
     const onSpawn = (data: { taxiway_id: string; event: 'TAKEOFF' | 'RUNWAY_HOLDING' | 'ENTERING' }) => {
@@ -344,7 +344,7 @@ export function LiveMonitor() {
     return () => { socket.off('sim:spawn-at-taxiway', onSpawn); };
   }, []);
 
-  // The source video jumped to a different time (see DetectorConfig.tsx's
+  // The source video jumped to a different time (see ZoneConfig.tsx's
   // handleVideoSeeking) — every taxiway's old Z1/Z2/Z3 state is now
   // meaningless, so drop any LIVE-tracked vehicle instead of leaving it
   // frozen mid-animation at a position that no longer corresponds to

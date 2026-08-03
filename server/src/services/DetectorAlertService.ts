@@ -95,11 +95,21 @@ class DetectorAlertService {
   // Arms (or extends, if already armed) the alert window for durationMs,
   // auto-starting STM and enabling RWY protection first if needed — same
   // logic DetectorConfig.tsx's armRunwayAlert used to do client-side.
-  async arm(durationMs: number): Promise<void> {
+  //
+  // mayCreate=false (ZoneConfig.tsx's Z2/Z3 motion-zone hits — operator
+  // request: "TRIGGER自動警戒一定要Z1觸發，只有告警觸發後Z2/Z3延長") means
+  // this call may only EXTEND an alert that's already active; it must never
+  // start a fresh one on its own. Checked here (server-owned alertUntil is
+  // the single source of truth) rather than against the client's own local
+  // copy, which can lag a socket round-trip behind. Only Z1 (mayCreate left
+  // at its default true) may ever transition alertUntil from null -> armed.
+  async arm(durationMs: number, mayCreate = true): Promise<void> {
     if (this.suppressUntil !== null) {
       if (Date.now() < this.suppressUntil) return;
       this.suppressUntil = null;
     }
+
+    if (!mayCreate && this.alertUntil === null) return;
 
     if (systemStateService.getPowerState() !== 'ACTIVE') {
       const previousState = systemStateService.getPowerState();

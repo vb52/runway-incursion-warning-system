@@ -178,7 +178,7 @@ export interface DetectorConfig {
   zones: Record<DetectorZoneId, DetectorRect>;
   masks: DetectorRect[];
   // Looping demo camera clip (GET /api/detector/video) stands in for a live
-  // feed. DetectorConfig.tsx reports "a plane appeared" to
+  // feed. ZoneConfig.tsx reports "a plane appeared" to
   // POST /api/demo/detect (for video_trigger_taxiway_id) from three
   // independent sources: TensorFlow.js + COCO-SSD object detection, simple
   // frame-diff motion detection, and operator-marked timestamps
@@ -195,9 +195,8 @@ export interface DetectorConfig {
   motion_zones: DetectorMotionZone[];
   // Fraction-of-pixels-changed (0-1) that counts as "something moved" in a
   // motion zone — shared across every zone, not per-zone. Persisted (rather
-  // than local React state) so both DetectorConfig.tsx (live tuning, next
-  // to the real-time score meter) and ZoneConfig.tsx (while calibrating
-  // zones) can show/edit the same value.
+  // than local React state) so it survives a reload and so the live score
+  // meter and the zone-calibration UI (both on ZoneConfig.tsx now) agree.
   motion_threshold: number;
   // Runway boundary trigger — a single region (drawn/edited on
   // ZoneConfig.tsx, same rect shape as a motion zone) representing where an

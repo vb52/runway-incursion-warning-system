@@ -6,7 +6,6 @@ import {
   FileText,
   ClipboardList,
   Settings,
-  Crosshair,
   Frame,
   Wifi,
   WifiOff,
@@ -15,7 +14,7 @@ import { useAppStore } from '../stores/appStore';
 import { ToastContainer } from './Toast';
 import { formatDisplay } from '../utils/datetime';
 import { LiveMonitor } from '../pages/LiveMonitor';
-import { DetectorConfigPage } from '../pages/DetectorConfig';
+import { ZoneConfigPage } from '../pages/ZoneConfig';
 
 function Clock() {
   const [time, setTime] = useState(() => formatDisplay(new Date().toISOString()));
@@ -54,11 +53,13 @@ interface NavGroup {
 //      server/ 底下那一套狀態機）自己的管理頁面：事件中心、操作紀錄、系統
 //      狀態。這些頁面完全不碰偵測器設定。
 //   3. 偵測器後台管理 — RIWS-POC（Python YOLO 偵測器，獨立 repo）的管理頁
-//      面。有偵測器設定（DetectorConfig.tsx，AI/動態/手動三重偵測開關、示範
-//      影片）跟偵測區域設定（ZoneConfig.tsx，Z1/Z2/Z3 等動態偵測區域的框選/
-//      編輯，從 DetectorConfig.tsx 拆出來的獨立頁面）。資料都存在
-//      detector_config 表（server/src/services/DetectorConfigService.ts），
-//      透過 RIWS-POC/src/riws_bridge.py 跟桌面版 Python 程式互相同步。
+//      面。只有偵測區域設定（ZoneConfig.tsx）——原本另外有一頁「偵測器設定」
+//      （DetectorConfig.tsx，AI/動態/手動三重偵測開關、示範影片），操作員要求
+//      整合成一頁後，AI/動態/手動偵測開關跟示範影片都搬進 ZoneConfig.tsx 了，
+//      這頁本身就是 Layout 常駐掛載的那頁（見下方 isDetector 說明），不再是
+//      兩個各自獨立、切走就卸載的頁面。資料都存在 detector_config 表
+//      （server/src/services/DetectorConfigService.ts），透過
+//      RIWS-POC/src/riws_bridge.py 跟桌面版 Python 程式互相同步。
 const navGroups: NavGroup[] = [
   {
     title: '主戰情表',
@@ -77,8 +78,7 @@ const navGroups: NavGroup[] = [
   {
     title: '偵測器後台管理',
     items: [
-      { to: '/detector', icon: Crosshair, label: '偵測器設定', sublabel: 'Detector Config' },
-      { to: '/detector/zones', icon: Frame, label: '偵測區域設定', sublabel: 'Zone Config' },
+      { to: '/detector', icon: Frame, label: '偵測區域設定', sublabel: 'Zone Config' },
     ],
   },
 ];
@@ -86,15 +86,15 @@ const navGroups: NavGroup[] = [
 export function Layout() {
   const { state } = useAppStore();
   const location = useLocation();
-  // LiveMonitor and DetectorConfigPage are rendered here directly (see
+  // LiveMonitor and ZoneConfigPage are rendered here directly (see
   // main.tsx's comment) rather than via <Outlet/>, always mounted for the
   // life of the app and just shown/hidden by CSS depending on the route.
-  // The reason is DetectorConfigPage: its AI/motion/manual detection
-  // setInterval loops (client/src/pages/DetectorConfig.tsx) must keep
-  // running when the operator switches to another page — a real detector
-  // doesn't stop watching the runway just because someone looked away from
-  // its settings screen. A normal <Route>-driven unmount would clearInterval
-  // every one of those loops the instant you navigated off /detector.
+  // The reason is ZoneConfigPage: its AI/motion/manual detection setInterval
+  // loops (client/src/pages/ZoneConfig.tsx) must keep running when the
+  // operator switches to another page — a real detector doesn't stop
+  // watching the runway just because someone looked away from its settings
+  // screen. A normal <Route>-driven unmount would clearInterval every one of
+  // those loops the instant you navigated off /detector.
   const isMonitor = location.pathname === '/' || location.pathname === '/monitor';
   const isDetector = location.pathname === '/detector';
 
@@ -214,7 +214,7 @@ export function Layout() {
             className="absolute inset-0 h-full overflow-auto"
             style={{ visibility: isDetector ? 'visible' : 'hidden', pointerEvents: isDetector ? 'auto' : 'none' }}
           >
-            <DetectorConfigPage />
+            <ZoneConfigPage />
           </div>
           {/* Every other page still uses normal route-driven mount/unmount. */}
           <Outlet />

@@ -172,7 +172,7 @@ export const demoApi = {
     confidence?: number;
     entering_runway?: boolean;
     // Real camera frame (base64 JPEG or data: URI) captured at the moment of
-    // detection — see DetectorConfig.tsx's incursion-line scanning. Becomes
+    // detection — see ZoneConfig.tsx's incursion-line scanning. Becomes
     // the event's real DETECTION_IMAGE instead of the generated placeholder.
     snapshot_base64?: string;
   }) =>
@@ -188,7 +188,7 @@ export const demoApi = {
 
 // ── Detector API (RIWS-POC integration) ───────────────────────────────────
 // Reads/writes the zone & mask layout shared with the Python detector.
-// See client/src/pages/DetectorConfig.tsx and RIWS-POC/src/riws_bridge.py.
+// See client/src/pages/ZoneConfig.tsx and RIWS-POC/src/riws_bridge.py.
 
 export const detectorApi = {
   getConfig: () => apiCall<{ success: boolean; data: DetectorConfig }>('/detector/config'),
@@ -199,10 +199,13 @@ export const detectorApi = {
     }),
   // Arms (or extends) the server-owned runway auto-alert window — see
   // DetectorAlertService. Broadcasts 'detector:alert-armed' to all clients.
-  armAlert: (durationMs: number) =>
+  // mayCreate=false (default true) — only extends an already-active alert,
+  // never starts a fresh one; see ZoneConfig.tsx's Z1-creates/Z2-Z3-extends
+  // rule.
+  armAlert: (durationMs: number, mayCreate = true) =>
     apiCall<{ success: boolean; data: { alertUntil: number | null } }>('/detector/alert/arm', {
       method: 'POST',
-      body: JSON.stringify({ duration_ms: durationMs }),
+      body: JSON.stringify({ duration_ms: durationMs, may_create: mayCreate }),
     }),
   // Manual early-clear of the alert window — see DetectorAlertService.clear().
   clearAlert: () =>

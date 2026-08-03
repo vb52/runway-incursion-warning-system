@@ -2,6 +2,8 @@ import React, { useEffect, useRef, useCallback, useState, forwardRef, useImperat
 import { RotateCcw } from 'lucide-react';
 import { TaxiwayState, TaxiwayId } from '../types';
 import { demoApi, taxiwayApi, detectorApi } from '../services/api';
+import { useAppStore } from '../stores/appStore';
+import { getSocket } from '../services/socketService';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -9,14 +11,21 @@ const SIM_TX_X = [105, 195, 285, 375, 465, 555];
 const SIMY = { NA: 27, NJ: 110, RC: 130, SJ: 150, SA: 233 } as const;
 const SIM_SPD = { taxi: 0.036, enter: 0.21, takeoff: 0.07, land: 0.038, vacate: 0.30, svc: 0.03 };
 // Starting TAXI_OUT progress for an 'ENTERING'-triggered vehicle (see
-// spawnAtTaxiway). This is NOT a guess to compensate for slow animation
-// (that was tried once and reverted — see CATCH_UP_MULTIPLIER below for the
-// actual fix for that) — it reflects where Z1's zone is actually drawn in
-// the video: near the junction, not at the apron. By the time Z1 fires, the
-// real plane is already most of the way down the taxiway, so starting the
-// icon at 0 would misrepresent where it actually is, not just animate it
-// slower than reality.
-const ENTERING_SPAWN_PROGRESS = 0.75;
+// spawnAtTaxiway) — 0, the very start of stage 1 (進入聯絡道), so Z1 plays a
+// genuine, visible "entering the taxiway" animation rather than appearing
+// already most of the way through it. (Previously 0.75, back when TAXI_OUT
+// covered the whole apron->junction span and was meant to approximate where
+// Z1's real zone sits in the video; now that TAXI_OUT only covers stage 1 —
+// apron->midpoint, see TAXI_STAGE_SPLIT — starting anywhere but 0 would
+// undercut the operator-requested three-distinct-animations design.)
+const ENTERING_SPAWN_PROGRESS = 0;
+// Bounded pause at the end of stage 1 (進入聯絡道) before automatically
+// continuing into stage 2 (聯絡道進跑道頭) — operator request ("Z1/Z2 停一秒
+// 直接進"): unlike takeoff (still strictly Z3-gated, see AT_JUNCTION's
+// takeoffPending check), this transition no longer waits indefinitely for
+// real Z2 evidence, only this short visual pause. Real Z2 evidence arriving
+// before the pause ends still short-circuits it (headPending, see TAXI_OUT).
+const Z1_STAGE_PAUSE_MS = 1000;
 // Per-vehicle temporary speed-up (see SimVehicle.catchUp) — when a later
 // zone (Z2, or Z2+Z3) confirms a plane is further along than its own
 // animation has visually reached yet, this accelerates ONLY that vehicle's
@@ -38,8 +47,16 @@ const MIN_SPAWN_GAP_MS = 4000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+// TAXI_OUT/TAXI_TO_HEAD/(ENTER_RWY+TAKEOFF_ROLL) are DEPART's three
+// operator-requested stages, each gated by its own real zone evidence
+// (Z1/Z2/Z3 respectively — see spawnAtTaxiway): 進入聯絡道 (apron -> taxiway,
+// TAXI_OUT), 聯絡道進跑道頭 (taxiway -> runway head, TAXI_TO_HEAD), 起飛
+// (ENTER_RWY -> TAKEOFF_ROLL). Splitting what used to be one continuous
+// apron->junction motion into two independently zone-gated phases is what
+// stops stage 2 from auto-playing the instant a plane is spawned, before Z2
+// has actually fired.
 type VehiclePhase =
-  | 'TAXI_OUT' | 'AT_JUNCTION' | 'ENTER_RWY' | 'TAKEOFF_ROLL'
+  | 'TAXI_OUT' | 'TAXI_TO_HEAD' | 'AT_JUNCTION' | 'ENTER_RWY' | 'TAKEOFF_ROLL'
   | 'LAND_ROLL' | 'VACATE_RWY' | 'TAXI_IN'
   | 'SVC_OUT' | 'SVC_HOLD' | 'SVC_RETURN';
 
@@ -75,15 +92,36 @@ interface SimVehicle {
   // only actual Z2+Z3 zone evidence (spawnAtTaxiway) may move it past the
   // junction, otherwise it reads as taking off without Z3 ever firing.
   origin: 'demo' | 'live';
+  // Set once by spawnAtTaxiway's TAKEOFF branch when confirmed Z3 evidence
+  // arrives for a vehicle that's still mid-taxi or waiting at the junction
+  // — TAKEOFF only ever gets emitted ONCE per taxiway (ZoneConfig.tsx's
+  // AircraftEvent.takeoffAnimationPlayed one-shot flag), so there is no
+  // second event to lean on later. This flag is what lets simStep's
+  // TAXI_OUT/AT_JUNCTION cases themselves carry the vehicle the rest of the
+  // way to ENTER_RWY once it
+  // actually arrives there, catch-up-accelerated but still visibly
+  // traveling — instead of the old behavior of teleporting it straight from
+  // wherever it currently was (sometimes still well back in TAXI_OUT)
+  // straight onto the runway, which is what "直接進跑道後直接起飛" was.
+  takeoffPending: boolean;
+  // Mirrors takeoffPending one stage earlier — set by spawnAtTaxiway's
+  // RUNWAY_HOLDING branch when real Z2 evidence arrives while the vehicle
+  // is still mid-stage-1 (TAXI_OUT, "entering the taxiway"), still paused.
+  // TAXI_OUT otherwise waits out a short bounded pause (Z1_STAGE_PAUSE_MS)
+  // and continues on its own regardless — this just tells it "don't wait
+  // out the rest of the pause, real Z2 evidence already arrived — carry
+  // straight into stage 2 (TAXI_TO_HEAD) now, still visibly (just
+  // catch-up-accelerated)".
+  headPending: boolean;
 }
 
 // Phase order for a DEPART-type vehicle's forward path — used to guard
-// forced phase transitions (see spawnAtTaxiway's Z2+Z3 handling) so they
+// forced phase transitions (see spawnAtTaxiway's Z1/Z2/Z3 handling) so they
 // only ever move a vehicle FORWARD, never backward/reset it to an earlier
 // point it's already passed. A phase not in this map (LAND/SVC_* — never
 // force-transitioned) sorts as "already past everything".
 const PHASE_ORDER: Partial<Record<VehiclePhase, number>> = {
-  TAXI_OUT: 0, AT_JUNCTION: 1, ENTER_RWY: 2, TAKEOFF_ROLL: 3,
+  TAXI_OUT: 0, TAXI_TO_HEAD: 1, AT_JUNCTION: 2, ENTER_RWY: 3, TAKEOFF_ROLL: 4,
 };
 function phaseOrder(p: VehiclePhase): number {
   return PHASE_ORDER[p] ?? Infinity;
@@ -129,6 +167,8 @@ function mkVehicle(t: Template): SimVehicle {
     color: randomVehicleColor(),
     catchUp: false,
     origin: t.origin ?? 'demo',
+    takeoffPending: false,
+    headPending: false,
   };
 }
 
@@ -173,18 +213,27 @@ function takeoffFrame(p: number): { xFrac: number; yLift: number; rotDeg: number
   return TAKEOFF_KEYFRAMES[TAKEOFF_KEYFRAMES.length - 1];
 }
 
+// Fraction of the apron->junction distance where stage 1 (進入聯絡道,
+// TAXI_OUT, Z1-gated) ends and stage 2 (聯絡道進跑道頭, TAXI_TO_HEAD,
+// Z2-gated) begins — an arbitrary but reasonable midpoint splitting what
+// used to be one continuous motion into two independently zone-gated
+// animations.
+const TAXI_STAGE_SPLIT = 0.5;
+
 function vehicleXY(v: SimVehicle): { x: number; y: number } {
   const { NA, NJ, RC, SJ, SA } = SIMY;
   const x = SIM_TX_X[v.txIdx];
   const ex = SIM_TX_X[v.exitTxIdx];
   const aY = v.side === 'N' ? NA : SA;
   const jY = v.side === 'N' ? NJ : SJ;
+  const mY = aY + (jY - aY) * TAXI_STAGE_SPLIT;
   const eJY = v.exitSide === 'N' ? NJ : SJ;
   const eAY = v.exitSide === 'N' ? NA : SA;
   const p = v.progress;
 
   switch (v.phase) {
-    case 'TAXI_OUT':     return { x, y: aY + (jY - aY) * Math.min(p, 1) };
+    case 'TAXI_OUT':     return { x, y: aY + (mY - aY) * Math.min(p, 1) };
+    case 'TAXI_TO_HEAD': return { x, y: mY + (jY - mY) * Math.min(p, 1) };
     case 'AT_JUNCTION':  return { x, y: jY };
     case 'ENTER_RWY':    return { x, y: jY + (RC - jY) * p };
     case 'TAKEOFF_ROLL': {
@@ -218,6 +267,7 @@ function vehicleColor(v: SimVehicle): string {
 function vehicleRotation(v: SimVehicle): number {
   switch (v.phase) {
     case 'TAXI_OUT':
+    case 'TAXI_TO_HEAD':
     case 'AT_JUNCTION':
     case 'ENTER_RWY':
       return v.side === 'N' ? 180 : 0; // heading toward the runway centerline
@@ -269,6 +319,7 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
   { taxiways, isActive, isRwyOn },
   ref
 ) {
+  const { state: appState, dispatch: appDispatch } = useAppStore();
   const svgRef = useRef<SVGSVGElement>(null);
   const vehiclesRef = useRef<SimVehicle[]>([]);
   const taxiwaysRef = useRef<TaxiwayState[]>(taxiways);
@@ -278,11 +329,13 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
   const elapsedRef = useRef(0);
   const speedRef = useRef(1);
   const demoCounterRef = useRef(0);
-  // One tracked vehicle per taxiway key (`${txIdx}${side}`) — see
-  // spawnAtTaxiway below. Z1+Z2 firing together isn't two different planes
-  // (one plane can't be in two places at once) — it's just Z2, so there's
-  // never more than one plane tracked per taxiway at a time.
-  const detectorVehiclesRef = useRef<Map<string, SimVehicle>>(new Map());
+  // Up to two tracked vehicles per taxiway key (`${txIdx}${side}`) — see
+  // spawnAtTaxiway below and ZoneConfig.tsx's AircraftEventState comment for
+  // the concurrency-cap reasoning ("支援兩台，Z1直接開第二個就好"): one plane
+  // still in transit through stage 1/2 (TAXI_OUT/TAXI_TO_HEAD), plus one
+  // already ahead at/past the runway head (AT_JUNCTION or later). ENTERING
+  // only ever creates a new entry when there's no in-transit one already.
+  const detectorVehiclesRef = useRef<Map<string, SimVehicle[]>>(new Map());
   // Date.now() ms of the last NEW vehicle created, per taxiway key — see
   // MIN_SPAWN_GAP_MS / canSpawnNew in spawnAtTaxiway.
   const lastSpawnAtRef = useRef<Map<string, number>>(new Map());
@@ -298,12 +351,17 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
   // to just the one vehicle with actual evidence — not a global speed match.
   const [speed, setSpeed] = useState(1);
   const [trackCount, setTrackCount] = useState(0);
-  // Gates spawnAtTaxiway (see below) — off by default. The detector's own
-  // alert/警戒 countdown (DetectorAlertService, server-side) is completely
-  // separate from this panel and keeps working regardless of this switch;
-  // LIVE only controls whether a detection also projects a moving vehicle
-  // onto this diagram.
-  const [live, setLive] = useState(false);
+  // Gates spawnAtTaxiway (see below) — off by default. Lifted to the shared
+  // AppStore (not a local useState here) so ZoneConfig.tsx's detection tick
+  // loop can also read it — real detections must not auto-arm runway
+  // protection while LIVE is off either (見「沒在LIVE的情況，不要自動切RWY
+  // ON啟動」). LIVE additionally still controls whether a detection projects
+  // a moving vehicle onto this diagram, same as before.
+  const live = appState.liveEnabled;
+  const setLive = useCallback((updater: boolean | ((prev: boolean) => boolean)) => {
+    const next = typeof updater === 'function' ? updater(appState.liveEnabled) : updater;
+    appDispatch({ type: 'SET_LIVE_ENABLED', payload: next });
+  }, [appState.liveEnabled, appDispatch]);
   const liveRef = useRef(false);
 
   useEffect(() => { taxiwaysRef.current = taxiways; }, [taxiways]);
@@ -385,12 +443,39 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
       }
       vLayer.innerHTML = h;
       setTrackCount(active);
+
+      // Safety net, independent of ZoneConfig.tsx's own event-state gating
+      // actually working — counts LIVE-origin vehicles currently mid-
+      // takeoff (ENTER_RWY/TAKEOFF_ROLL) per taxiway key. Should never
+      // exceed 2: up to two concurrent aircraft are legitimate per taxiway
+      // now (operator request: "支援兩台，Z1直接開第二個就好" — see
+      // detectorVehiclesRef's comment) — a front plane can still be
+      // finishing TAKEOFF_ROLL while a second, independently-tracked back
+      // plane just started its own ENTER_RWY. (DEMO vehicles on OTHER
+      // taxiways taking off at the same time are normal and excluded —
+      // this is specifically "the same taxiway has MORE aircraft departing
+      // than the two-event design allows for".) A future regression that
+      // reintroduces uncapped duplicate spawning surfaces here immediately
+      // instead of silently shipping.
+      const takeoffCounts = new Map<string, number>();
+      for (const v of vehiclesRef.current) {
+        if (v.simState === 'DONE' || v.origin !== 'live') continue;
+        if (v.phase !== 'ENTER_RWY' && v.phase !== 'TAKEOFF_ROLL') continue;
+        const key = `${v.txIdx}${v.side}`;
+        takeoffCounts.set(key, (takeoffCounts.get(key) ?? 0) + 1);
+      }
+      for (const [key, count] of takeoffCounts) {
+        if (count > 2) {
+          // eslint-disable-next-line no-console
+          console.error(`Duplicate takeoff aircraft detected on taxiway ${key}: ${count} vehicles mid-takeoff simultaneously (max 2 expected).`);
+        }
+      }
     }
   }, []);
 
   // Removes every LIVE-tracked (detectorVehiclesRef) vehicle from the field
   // and its pending spawn-gap state — used both when the LIVE toggle turns
-  // off (below) and when DetectorConfig.tsx reports the source video has
+  // off (below) and when ZoneConfig.tsx reports the source video has
   // jumped to a different time (see the imperative clearLive handle exposed
   // below): a vehicle whose position was built from a now-stale time point
   // has nothing meaningful left to show once that point is gone. DEMO START
@@ -398,10 +483,16 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
   // — a video seek has nothing to do with an operator-started demo scenario.
   const clearLiveVehicles = useCallback(() => {
     lastSpawnAtRef.current.clear();
-    const tracked = new Set(detectorVehiclesRef.current.values());
     detectorVehiclesRef.current.clear();
-    if (tracked.size === 0) return;
-    vehiclesRef.current = vehiclesRef.current.filter(v => !tracked.has(v));
+    // Filtered by origin, not just "currently in detectorVehiclesRef" — a
+    // vehicle mid-takeoff is DELIBERATELY untracked from that map the
+    // moment it departs (see spawnAtTaxiway's TAKEOFF branch), so filtering
+    // only against it would miss exactly the vehicle most likely to still
+    // be visibly animating, leaving a stray departing plane on screen even
+    // after an explicit LIVE-off/seek/reset.
+    const before = vehiclesRef.current.length;
+    vehiclesRef.current = vehiclesRef.current.filter(v => v.origin !== 'live');
+    if (vehiclesRef.current.length === before) return;
     renderFrame();
   }, [renderFrame]);
 
@@ -421,38 +512,131 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
     for (const v of vehiclesRef.current) {
       if (v.simState === 'DONE') continue; // pruned from the array below
 
-      // Check if incursion was cleared by operator — proceed straight through
-      // onto the runway instead of backing away (no reversing animation).
+      // Check if incursion was cleared by operator — for DEMO vehicles,
+      // proceed straight through onto the runway instead of backing away (no
+      // reversing animation), same "simulated authorization alone is
+      // enough" principle as AT_JUNCTION's demo-only auto-proceed branch
+      // below. For LIVE vehicles, clearing an incursion must NOT
+      // auto-authorize takeoff — only real Z3 evidence may (see
+      // spawnAtTaxiway's TAKEOFF branch) — so it just returns to normal
+      // AT_JUNCTION waiting, exactly as if the incursion had never
+      // happened. Without this split, any live plane that ever triggered a
+      // real incursion (taxiway GUARDED while it waited at the runway head
+      // — the ordinary case whenever RWY protection is armed and this
+      // taxiway isn't explicitly authorized) would take off the instant
+      // that incursion cleared (RESET, re-authorization, etc.) — with no Z3
+      // motion involved at all. This was "沒等 Z3 就起飛了" reported live.
       if (v.simState === 'INCURSION' && v.phase === 'AT_JUNCTION') {
         const twId = `${v.txIdx + 1}${v.side}` as TaxiwayId;
         if (getTwState(twId) !== 'INCURSION_LATCHED') {
           v.simState = 'ACTIVE';
           v.incTriggered = false;
-          v.phase = 'ENTER_RWY'; v.progress = 0;
+          if (v.origin === 'demo') {
+            v.phase = 'ENTER_RWY'; v.progress = 0;
+          }
+          // else (live): stays at AT_JUNCTION. If takeoffPending was already
+          // set (Z3 confirmed while the incursion was active), the normal
+          // AT_JUNCTION case below picks it up on the very next tick.
         }
         continue;
       }
 
-      // CATCH_UP_MULTIPLIER only ever boosts TAXI_OUT progress (see below) —
-      // that's the one phase where "real evidence says the plane is further
-      // along than the icon has visually reached" actually applies. Once a
-      // vehicle is bumped into ENTER_RWY (via spawnAtTaxiway's Z2+Z3
-      // handling) there's no lag left to catch up on — it just started that
-      // leg fresh — so ENTER_RWY/TAKEOFF_ROLL always run at normal speed;
-      // boosting them too made the takeoff roll blow by almost instantly
-      // ("起飛動畫太快了").
+      // CATCH_UP_MULTIPLIER only ever boosts TAXI_OUT/TAXI_TO_HEAD progress
+      // (see below) — those are the two phases where "real evidence says the
+      // plane is further along than the icon has visually reached" actually
+      // applies. Once a vehicle is bumped into ENTER_RWY (via spawnAtTaxiway's
+      // Z2/Z3 handling) there's no lag left to catch up on — it just started
+      // that leg fresh — so ENTER_RWY/TAKEOFF_ROLL always run at normal
+      // speed; boosting them too made the takeoff roll blow by almost
+      // instantly ("起飛動畫太快了").
       const vDt = v.catchUp ? dt * CATCH_UP_MULTIPLIER : dt;
 
       switch (v.phase) {
         case 'TAXI_OUT':
+          // Stage 1 (進入聯絡道) — plays automatically once spawned (Z1
+          // creates the vehicle), same as before.
+          if (v.progress < 1) {
+            v.progress += SIM_SPD.taxi * vDt;
+            if (v.progress >= 1) {
+              v.progress = 1;
+              v.holdTimer = Z1_STAGE_PAUSE_MS; // starts the bounded pause below
+            }
+          } else if (v.origin === 'demo' || v.takeoffPending || v.headPending) {
+            // DEMO: no real zone evidence to wait for at all — same
+            // principle as AT_JUNCTION's demo-vehicle auto-proceed below.
+            // LIVE with takeoffPending/headPending: real Z2 (or even Z3)
+            // evidence already arrived during the pause — don't wait out
+            // the rest of it, carry straight into stage 2, catch-up-
+            // accelerated so it's still visible, not instant.
+            v.phase = 'TAXI_TO_HEAD';
+            v.progress = 0;
+            v.catchUp = v.origin !== 'demo';
+            v.headPending = false;
+          } else {
+            // LIVE, no real evidence yet: bounded pause (Z1_STAGE_PAUSE_MS),
+            // NOT an indefinite freeze — operator request ("Z1/Z2 停一秒直接
+            // 進"). Unlike takeoff (still strictly Z3-gated, see AT_JUNCTION),
+            // this transition auto-continues once the pause elapses even
+            // without real Z2 evidence.
+            v.holdTimer -= dtMs * spd;
+            if (v.holdTimer <= 0) {
+              v.phase = 'TAXI_TO_HEAD';
+              v.progress = 0;
+            }
+          }
+          break;
+
+        case 'TAXI_TO_HEAD':
+          // Stage 2 (聯絡道進跑道頭) — entered via real Z2 evidence OR
+          // TAXI_OUT's bounded 1s pause elapsing (see that case), whichever
+          // comes first. Once started, always plays through to AT_JUNCTION
+          // on its own — unlike stage 1's entry, there's no separate wait
+          // gating THIS completion.
           v.progress += SIM_SPD.taxi * vDt;
-          if (v.progress >= 1) { v.progress = 1; v.phase = 'AT_JUNCTION'; v.holdTimer = 2800; v.catchUp = false; }
+          if (v.progress >= 1) {
+            v.progress = 1;
+            v.phase = 'AT_JUNCTION';
+            // takeoffPending vehicles already have confirmed Z3 evidence —
+            // skip the normal authorization-wait timer (0 instead of 2800)
+            // so they don't sit idling at the junction once they actually
+            // get there, but still keep catchUp on (see below) rather than
+            // clearing it, since AT_JUNCTION still has to carry them the
+            // rest of the way to ENTER_RWY.
+            v.holdTimer = v.takeoffPending ? 0 : 2800;
+            v.catchUp = v.takeoffPending;
+            // Reports back to ZoneConfig.tsx's activeAircraftEventsRef state
+            // machine that this taxiway's stage-2 animation has actually
+            // reached the runway head — that's real animation-timing
+            // knowledge only this component has. ZoneConfig.tsx uses it to
+            // move ENTERING_RUNWAY_HEAD -> HOLDING_AT_RUNWAY_HEAD and gate
+            // takeoff (stage 3) on it, so a takeoff can never start while
+            // this animation is still visibly playing.
+            if (v.origin === 'live') {
+              getSocket().emit('sim:aircraft-at-runway-head', { taxiway_id: `${v.txIdx + 1}${v.side}` });
+            }
+          }
           break;
 
         case 'AT_JUNCTION': {
           v.holdTimer -= dtMs * spd;
           if (v.holdTimer > 0) break;
           v.holdTimer = 0;
+          if (v.takeoffPending) {
+            // Confirmed Z3 evidence already arrived while this vehicle was
+            // still mid-taxi (see spawnAtTaxiway's TAKEOFF branch) — it just
+            // caught up to the junction under catchUp, and now carries
+            // straight through to ENTER_RWY the same way the "already at
+            // the junction when TAKEOFF confirmed" case does below. This is
+            // stronger evidence than the simulated authorization gate, so it
+            // overrides GUARDED here too, same as that other case always has.
+            v.phase = 'ENTER_RWY';
+            v.progress = 0;
+            v.simState = 'ACTIVE';
+            v.incTriggered = false;
+            v.catchUp = true;
+            v.takeoffPending = false;
+            break;
+          }
           const twId = `${v.txIdx + 1}${v.side}` as TaxiwayId;
           const tw = getTwState(twId);
           if (tw === 'GUARDED' && !v.incTriggered) {
@@ -490,7 +674,23 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
 
         case 'TAKEOFF_ROLL':
           v.progress += SIM_SPD.takeoff * dt;
-          if (v.progress >= 1) { v.simState = 'DONE'; v.catchUp = false; }
+          if (v.progress >= 1) {
+            v.simState = 'DONE';
+            v.catchUp = false;
+            // Reports back to ZoneConfig.tsx that this taxiway's takeoff
+            // animation actually finished, so it clears activeAircraftEventsRef
+            // for this taxiway — the icon/event may only be removed on
+            // takeoff completing, RESET, a video seek, or a demo reset (see
+            // that file's 'sim:aircraft-departed' listener), never by a
+            // timer or by Z1/Z2/Z3 momentarily dropping out. Clearing it here
+            // is also what lets a genuinely later, new Z1 detection on the
+            // SAME taxiway (a second departure later in the same video loop)
+            // start a fresh event instead of being blocked for the rest of
+            // the session.
+            if (v.origin === 'live') {
+              getSocket().emit('sim:aircraft-departed', { taxiway_id: `${v.txIdx + 1}${v.side}` });
+            }
+          }
           break;
 
         case 'LAND_ROLL':
@@ -570,13 +770,13 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
       vehiclesRef.current
         .filter(v =>
           (v.simState === 'ACTIVE' || v.simState === 'INCURSION') &&
-          (v.phase === 'TAXI_OUT' || v.phase === 'AT_JUNCTION'))
+          (v.phase === 'TAXI_OUT' || v.phase === 'TAXI_TO_HEAD' || v.phase === 'AT_JUNCTION'))
         .map(v => `${v.txIdx}${v.side}`)
     );
     const available: { txIdx: number; side: 'N' | 'S' }[] = [];
     // txIdx 0 (1N/1S) is reserved for live detector traffic — that's where
     // the motion zones (Z1/Z2/Z3) are currently mapped (see
-    // DetectorConfig.tsx's motion_zones config), so picking it here too
+    // ZoneConfig.tsx's motion_zones config), so picking it here too
     // would collide a random demo vehicle with a real detector-tracked one
     // on the same taxiway. Revisit if zones ever get reassigned elsewhere.
     for (let txIdx = 1; txIdx < 6; txIdx++) {
@@ -597,48 +797,56 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
   }, [renderFrame, startSim]);
 
   // Detector-triggered spawn — called from LiveMonitor.tsx when
-  // DetectorConfig.tsx's motion tick loop confirms a runway event (see that
-  // file's 事件判定 section: determineRunwayEvent + the consecutive-tick
-  // confirmation, 'sim:spawn-at-taxiway'), so a real video detection visibly
-  // shows up in the ground-sim diagram instead of the two staying visually
-  // disconnected. Gated by the LIVE toggle (see the header button) — the
-  // actual RWY 警戒 countdown (server-side) runs regardless of this switch or
-  // panel; LIVE only controls this projection.
+  // ZoneConfig.tsx's activeAircraftEventsRef state machine advances a
+  // taxiway's event (see that file's 事件判定 section, 'sim:spawn-at-taxiway'),
+  // so a real video detection visibly shows up in the ground-sim diagram
+  // instead of the two staying visually disconnected. Gated by the LIVE
+  // toggle (see the header button) — the actual RWY 警戒 countdown
+  // (server-side) runs regardless of this switch or panel; LIVE only
+  // controls this projection.
   //
-  // `event` mostly arrives already fully judged — RUNWAY_HOLDING/TAKEOFF come
-  // from DetectorConfig.tsx's determineRunwayEvent + EVENT_CONFIRM_TICKS
-  // consecutive-tick confirmation, so this function's job for those two is
-  // just to play the matching animation/phase transition, never to re-derive
-  // Z1/Z2/Z3 combos itself (that re-derivation used to live here and was the
-  // source of "entering animation starts, then flips to takeoff a moment
-  // later" bugs — a raw per-tick zone read can look like one thing one tick
-  // and another the next before the sender itself had settled on an answer).
-  // ENTERING is the one exception: it's a lighter-weight, UNCONFIRMED "a
-  // plane showed up" ping (Z1 alone, no debounce) — not a determineRunwayEvent
-  // verdict at all, see that function's comment for why Z1 alone stays NONE
-  // there. It exists purely so the ground-sim panel has something to show as
-  // soon as a plane is first seen — without it, since RUNWAY_HOLDING needs Z1
-  // AND Z2 in the exact same tick and those zones are normally drawn as
-  // physically separate spots, a plane can go long stretches (or the whole
-  // approach) without ever showing up on screen at all.
-  //   - ENTERING: spawns a new vehicle if nothing is tracked yet, starting at
-  //     ENTERING_SPAWN_PROGRESS (not 0) since Z1's zone is physically drawn
-  //     near the junction, not the apron. If something's already tracked,
+  // `event` always arrives already fully judged by ZoneConfig.tsx's own
+  // state machine — this function's job is only to play the matching
+  // animation/phase transition, never to re-derive Z1/Z2/Z3 combos itself.
+  //
+  // ENTERING is the ONLY event that may create a new vehicle — it mirrors
+  // ZoneConfig.tsx's rule that Z1 is the only thing that may create an
+  // AircraftEvent. RUNWAY_HOLDING and TAKEOFF only ever advance an
+  // ALREADY-tracked vehicle; if nothing is tracked for this taxiway when
+  // they arrive (e.g. LIVE was off when Z1 first fired, or the vehicle
+  // already departed and untracked), they are a no-op rather than spawning
+  // a fresh one. This is what stops a plane's first-ever appearance on a
+  // taxiway from being a "RUNWAY_HOLDING" (spawned directly at/near the
+  // threshold, no visible taxi run) or "TAKEOFF" (spawned already departing)
+  // — previously possible whenever Z1's own tick never fired in isolation,
+  // and the reason a plane could look like it "took off the instant it
+  // entered the runway" even though every individual latch upstream was
+  // behaving exactly as designed. See ZoneConfig.tsx's AircraftEvent comment.
+  // Three stages, each its own animation, each gated by its own zone —
+  // 進入聯絡道 (TAXI_OUT) / 聯絡道進跑道頭 (TAXI_TO_HEAD) / 起飛 (ENTER_RWY ->
+  // TAKEOFF_ROLL) — see VehiclePhase's comment. Splitting stages 1 and 2 into
+  // separate phases (rather than one continuous apron->junction motion) is
+  // what stops stage 2 from auto-playing the instant a plane spawns, before
+  // Z2 has actually fired.
+  //   - ENTERING (Z1): spawns a new vehicle if nothing is tracked yet, at
+  //     ENTERING_SPAWN_PROGRESS = 0 — plays the full stage-1 "entering the
+  //     taxiway" animation from the apron. If something's already tracked,
   //     does nothing — repeat pings while Z1 stays hit are expected and
   //     harmless.
-  //   - RUNWAY_HOLDING: a plane is at the threshold right now. If there's
-  //     already a tracked vehicle still mid-taxi, this is live evidence it's
-  //     actually further along than the animation has visually reached —
-  //     accelerates (CATCH_UP_MULTIPLIER) just its remaining taxi so it
-  //     visibly, not instantly, catches up. If nothing's tracked yet, spawns
-  //     one directly at the junction instead of dropping the signal.
-  //   - TAKEOFF: taking off right now. Same "spawn if untracked, otherwise
-  //     push forward" shape as RUNWAY_HOLDING, but landing the vehicle in
-  //     ENTER_RWY instead of AT_JUNCTION. Bumps an already-tracked vehicle
-  //     past the junction (a one-time phase transition — TAKEOFF is only
-  //     ever confirmed once Z3 has shown real, sustained motion, strong
-  //     enough evidence to override the simulated authorization gate) then
-  //     catch-up-accelerates it through ENTER_RWY -> TAKEOFF_ROLL.
+  //   - RUNWAY_HOLDING (Z2): starts (or accelerates) stage 2 on the SAME
+  //     tracked aircraft. If stage 1 is still playing, marks headPending so
+  //     TAXI_OUT's own completion carries it straight into stage 2 rather
+  //     than freezing and waiting; if stage 2 is already playing,
+  //     accelerates (CATCH_UP_MULTIPLIER) its remaining distance so it
+  //     visibly, not instantly, catches up. If nothing's tracked
+  //     (untracked/never spawned), dropped — never spawns one here.
+  //   - TAKEOFF (Z3): stage 3. Bumps the already-tracked vehicle past the
+  //     junction (a one-time phase transition — TAKEOFF is only ever
+  //     confirmed once Z3 has shown real, sustained motion AND stage 2 has
+  //     actually finished, strong enough evidence to override the simulated
+  //     authorization gate) then catch-up-accelerates it through whichever
+  //     stages remain -> ENTER_RWY -> TAKEOFF_ROLL. If nothing's tracked,
+  //     dropped.
   const spawnAtTaxiway = useCallback((taxiwayId: string, event: 'TAKEOFF' | 'RUNWAY_HOLDING' | 'ENTERING') => {
     if (!liveRef.current) return; // LIVE off — alert/警戒 still runs server-side, just no on-field projection
     const match = /^([1-6])([NS])$/.exec(taxiwayId);
@@ -647,8 +855,12 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
     const side = match[2] as 'N' | 'S';
     const key = `${txIdx}${side}`;
 
-    const tracked = detectorVehiclesRef.current.get(key);
-    const onField = !!tracked && vehiclesRef.current.includes(tracked) && tracked.simState !== 'DONE';
+    // Up to two vehicles may be tracked per taxiway — see
+    // detectorVehiclesRef's comment. onField filters out anything pruned
+    // from vehiclesRef (DONE) or otherwise stale, and is the "current truth"
+    // every branch below reads and writes back through.
+    const trackedAll = detectorVehiclesRef.current.get(key) ?? [];
+    const onField = trackedAll.filter((v) => vehiclesRef.current.includes(v) && v.simState !== 'DONE');
     // Debounces NEW-vehicle creation per taxiway — see MIN_SPAWN_GAP_MS.
     // Marks the attempt regardless of outcome, so a rapid run of blips only
     // ever costs one real spawn instead of resetting the window every hit.
@@ -661,42 +873,87 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
     };
 
     if (event === 'TAKEOFF') {
-      let veh = onField ? tracked : undefined;
-      if (!veh && canSpawnNew()) {
-        veh = mkVehicle({ id: `Z${++demoCounterRef.current}`, type: 'DEPART', side, txIdx, origin: 'live' });
-        veh.phase = 'ENTER_RWY';
-        veh.progress = 0;
-        vehiclesRef.current.push(veh);
-      }
-      if (veh && phaseOrder(veh.phase) < phaseOrder('TAKEOFF_ROLL')) {
-        if (veh.phase === 'TAXI_OUT' || veh.phase === 'AT_JUNCTION') {
+      // Stage 3 (起飛) — never spawns. ZoneConfig.tsx only ever emits
+      // TAKEOFF for a taxiway whose event already passed through Z1
+      // (ENTERING) and Z2 (RUNWAY_HOLDING) first, so a tracked vehicle
+      // should already exist. Targets whichever onField vehicle is FURTHEST
+      // along (phaseOrder) — with up to two tracked, that's always the one
+      // ahead/at the runway head, never a newer one still in transit
+      // through stage 1/2 (a different plane's event). If nothing's
+      // tracked (untracked — e.g. LIVE was off earlier in this aircraft's
+      // event, or it already departed), this is simply dropped.
+      const veh = onField
+        .filter((v) => phaseOrder(v.phase) < phaseOrder('TAKEOFF_ROLL'))
+        .sort((a, b) => phaseOrder(b.phase) - phaseOrder(a.phase))[0];
+      if (veh) {
+        if (veh.phase === 'AT_JUNCTION') {
+          // Already essentially at the threshold — a small, reasonable skip
+          // straight onto the runway, same as always.
           veh.phase = 'ENTER_RWY';
           veh.progress = 0;
           veh.simState = 'ACTIVE';
           veh.incTriggered = false;
+        } else if (veh.phase === 'TAXI_TO_HEAD' || veh.phase === 'TAXI_OUT') {
+          // Still mid stage-1/stage-2 (the icon's own pacing can lag behind
+          // what the real video already shows, especially at higher
+          // playback speeds) — do NOT teleport it straight onto the runway
+          // from wherever it currently is; that reads as
+          // "直接進跑道後直接起飛" (skips the remaining stages entirely).
+          // Instead mark it takeoffPending and let simStep's own TAXI_OUT/
+          // TAXI_TO_HEAD/AT_JUNCTION cases carry it the rest of the way,
+          // visibly (just catch-up-accelerated) through each remaining
+          // stage once it actually gets there. In practice ZoneConfig.tsx
+          // only emits TAKEOFF once entryAnimationCompleted is already true
+          // (i.e. this vehicle already reported AT_JUNCTION — see simStep's
+          // TAXI_TO_HEAD case), so this branch is mostly a defensive
+          // fallback for network/timing jitter, not the common path.
+          veh.takeoffPending = true;
         }
         veh.catchUp = true;
-        detectorVehiclesRef.current.delete(key); // departing — no longer tracked
+        // Departing — no longer tracked, but the OTHER vehicle (if any,
+        // still in transit through stage 1/2 as a separate plane) stays
+        // tracked.
+        const remaining = onField.filter((v) => v !== veh);
+        if (remaining.length > 0) detectorVehiclesRef.current.set(key, remaining);
+        else detectorVehiclesRef.current.delete(key);
       }
     } else if (event === 'RUNWAY_HOLDING') {
-      if (onField) {
-        if (tracked.phase === 'TAXI_OUT') tracked.catchUp = true;
-      } else if (canSpawnNew()) {
-        const v = mkVehicle({ id: `Z${++demoCounterRef.current}`, type: 'DEPART', side, txIdx, origin: 'live' });
-        v.phase = 'AT_JUNCTION';
-        v.progress = 1;
-        v.holdTimer = 800; // brief settle, then the normal AT_JUNCTION authorization check takes over
-        vehiclesRef.current.push(v);
-        detectorVehiclesRef.current.set(key, v);
+      // Stage 2 (聯絡道進跑道頭) — never spawns, only advances whichever
+      // onField vehicle is still in transit (TAXI_OUT/TAXI_TO_HEAD); the
+      // "ahead" one (AT_JUNCTION or later), if any, is a different plane's
+      // event and unaffected. If nothing's in transit, this is dropped
+      // rather than spawning a fresh vehicle straight at the junction (that
+      // used to be possible and is exactly what let a plane's first-ever
+      // appearance skip the taxi run entirely — see spawnAtTaxiway's header
+      // comment).
+      const tracked = onField.find((v) => v.phase === 'TAXI_OUT' || v.phase === 'TAXI_TO_HEAD');
+      if (tracked) {
+        if (tracked.phase === 'TAXI_OUT') {
+          // Stage 1 hasn't finished playing yet — don't teleport past it.
+          // headPending lets TAXI_OUT's own completion check carry it
+          // straight into stage 2 once it naturally gets there, catch-up-
+          // accelerated so it's still visible, not instant.
+          tracked.headPending = true;
+        }
+        tracked.catchUp = true;
       }
     } else if (event === 'ENTERING') {
-      if (!onField && canSpawnNew()) {
+      // Stage 1 (進入聯絡道) — the ONLY event that may create a new vehicle,
+      // mirroring ZoneConfig.tsx's rule that Z1 is the only thing that may
+      // create an AircraftEvent. Only creates one if nothing is currently in
+      // transit (TAXI_OUT/TAXI_TO_HEAD) — a vehicle already at AT_JUNCTION
+      // or later is physically clear of Z1's zone, so a fresh Z1 hit at that
+      // point is unambiguously a second, independent plane (operator
+      // request: "支援兩台，Z1直接開第二個就好"), not a repeat ping for the
+      // same one.
+      const hasInTransit = onField.some((v) => v.phase === 'TAXI_OUT' || v.phase === 'TAXI_TO_HEAD');
+      if (!hasInTransit && canSpawnNew()) {
         // Always DEPART — detector-triggered spawns are real video
         // detections, never a ground vehicle guess (see mkVehicle icon).
         const v = mkVehicle({ id: `Z${++demoCounterRef.current}`, type: 'DEPART', side, txIdx, origin: 'live' });
         v.progress = ENTERING_SPAWN_PROGRESS;
         vehiclesRef.current.push(v);
-        detectorVehiclesRef.current.set(key, v);
+        detectorVehiclesRef.current.set(key, [...onField, v]);
       }
     }
 
@@ -733,7 +990,7 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
   // handleOmitAllIncursions).
   //
   // Also clears/suppresses the server's detector-alert window (same
-  // endpoint DetectorConfig.tsx's own RESET button uses) even though this
+  // endpoint ZoneConfig.tsx's own RESET button uses) even though this
   // button never touches RWY/STM state itself — without it, the background
   // motion-detection loop (still running regardless of page, see
   // socketHandlers.ts's 'sim:spawn-at-taxiway' relay) would fire a spawn
@@ -823,7 +1080,7 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
           <span className="font-mono text-[10px] text-[#333]">|</span>
           <button
             onClick={() => setLive(v => !v)}
-            title="關閉時，偵測器的動態偵測只會維持跑道警戒倒數，不會在這個模擬畫面生成/移動車輛"
+            title="關閉時，偵測器的動態偵測不會自動啟動跑道保護，也不會在這個模擬畫面生成/移動車輛"
             className="flex items-center gap-1.5 font-mono text-[10px] px-2.5 py-0.5 rounded border transition-colors"
             style={{
               background: live ? 'rgba(0,255,136,0.08)' : 'transparent',

@@ -4,7 +4,7 @@ import { RefreshCw } from 'lucide-react';
 import { getSocket } from '../services/socketService';
 import { getDetectorVideoElement, onDetectorVideoElementChange } from '../services/detectorVideoRegistry';
 
-// Loop preview of the detector's demo camera clip — mirrors DetectorConfig.tsx's
+// Loop preview of the detector's demo camera clip — mirrors ZoneConfig.tsx's
 // own <video> element via canvas instead of owning a second independent
 // decode of the same ~330MB source. That page's video can never pause (its
 // detection loops depend on it decoding continuously in the background), so
@@ -16,7 +16,7 @@ import { getDetectorVideoElement, onDetectorVideoElementChange } from '../servic
 // 主戰情表 (this page), the most common place to notice choppy playback.
 //
 // Because there's no local <video> element anymore, seeking/changing speed
-// from this page acts directly on the shared element (DetectorConfig.tsx's),
+// from this page acts directly on the shared element (ZoneConfig.tsx's),
 // then broadcasts the change via Socket.IO the same way it always did — that
 // page's own useVideoSync instance is what actually keeps the shared element
 // drift-corrected; this component only reads from it and forwards operator
@@ -133,7 +133,7 @@ export function VideoFeed({ className }: { className?: string }) {
     getSocket().emit('video:update', { playbackRate: video.playbackRate, currentTime: t });
   };
 
-  // Reloads the actual shared source (DetectorConfig.tsx's <video>) — fixes
+  // Reloads the actual shared source (ZoneConfig.tsx's <video>) — fixes
   // this preview AND detection at once now, instead of just a local copy
   // that was never the real problem for either.
   const reloadVideo = () => {

@@ -183,7 +183,7 @@ RIWS/
 │       │   ├── EventDetail.tsx       # 事件詳情 + VLM 分析結果（屬於「RIWS 後台管理」分組）
 │       │   ├── AuditLog.tsx          # 稽核日誌表格（屬於「RIWS 後台管理」分組）
 │       │   ├── SystemStatus.tsx      # 系統健康狀態頁（屬於「RIWS 後台管理」分組）
-│       │   └── DetectorConfig.tsx    # ★ RIWS-POC Zone/Mask 網頁編輯器（屬於「偵測器後台管理」分組，見下方 RIWS-POC 整合章節）
+│       │   └── ZoneConfig.tsx        # ★ RIWS-POC Zone/Mask 網頁編輯器 + AI/動態/手動偵測（屬於「偵測器後台管理」分組，Layout.tsx 常駐掛載，見下方 RIWS-POC 整合章節）
 │       ├── services/
 │       │   ├── api.ts                # ★ 所有 REST API 呼叫函式
 │       │   ├── AudioController.ts    # 語音告警（"Check Runway"）
@@ -379,7 +379,7 @@ FAULT：攝影機異常時進入此狀態
 | `GET` | `/api/detector/config` | 取得目前的 Zone A/B/C + Mask 設定 |
 | `PUT` | `/api/detector/config` | 更新 Zone/Mask 設定（`{ frame_w, frame_h, zones, masks }`） |
 
-這兩支 API 是 client 的「偵測器後台管理 → 偵測器設定」頁面（`DetectorConfig.tsx`）與 RIWS-POC（Python 偵測器，另一個獨立 repo）共用的設定同步點，詳見下方「[RIWS-POC 偵測器整合](#riws-poc-偵測器整合)」章節。
+這兩支 API 是 client 的「偵測器後台管理 → 偵測區域設定」頁面（`ZoneConfig.tsx`）與 RIWS-POC（Python 偵測器，另一個獨立 repo）共用的設定同步點，詳見下方「[RIWS-POC 偵測器整合](#riws-poc-偵測器整合)」章節。
 
 ### 稽核日誌
 
@@ -471,7 +471,7 @@ export const myApi = {
 
 1. **主戰情表** — 兩個系統共用的即時操作畫面，目前只有 `LiveMonitor`。
 2. **RIWS 後台管理** — 主系統（本 repo `server/`）自己的管理頁面：事件中心、操作紀錄、系統狀態。
-3. **偵測器後台管理** — RIWS-POC（Python YOLO 偵測器，獨立 repo）的管理頁面，目前只有 `DetectorConfig.tsx`。
+3. **偵測器後台管理** — RIWS-POC（Python YOLO 偵測器，獨立 repo）的管理頁面，目前只有 `ZoneConfig.tsx`（原本另外有一頁 `DetectorConfig.tsx`，操作員要求整合成一頁後合併進來，見 `Layout.tsx` 的常駐掛載說明）。
 
 新增頁面時請對號放進正確分組（`Layout.tsx` 裡的 `navGroups` 常數有詳細註解），不要因為省事就塞錯地方。
 
@@ -516,7 +516,7 @@ export const myApi = {
 | 方式 | 觸發點 | 說明 |
 |------|--------|------|
 | `spawnDemoVehicle` | 面板上的「DEMO START」按鈕 | 隨機挑一個目前空著的聯絡道口，生成一台車 |
-| `spawnAtTaxiway` | Socket `sim:spawn-at-taxiway`（見 `socketHandlers.ts`） | 偵測器（`DetectorConfig.tsx` 的動態偵測）回報「某聯絡道有飛機」時，在對應聯絡道口生成一台車，讓模擬畫面跟真實影片偵測對得起來 |
+| `spawnAtTaxiway` | Socket `sim:spawn-at-taxiway`（見 `socketHandlers.ts`） | 偵測器（`ZoneConfig.tsx` 的動態偵測）回報「某聯絡道有飛機」時，在對應聯絡道口生成一台車，讓模擬畫面跟真實影片偵測對得起來 |
 
 兩種都是一次性（one-shot）：完成流程（起飛/返場）後直接從陣列移除，不會遞迴重生。曾經有第三種「腳本化機隊」（固定時間表自動生成 A1-A6/L1-L3/V1-V3），因為會在背景持續產生入侵告警、干擾操作員判斷是否為真實偵測觸發而移除。
 
@@ -551,7 +551,7 @@ RIWS-POC (Python, 獨立進程/獨立機器亦可)
 RIWS (本 repo, Node/Express + SQLite)
   ├─ server/src/routes/demoRoutes.ts     — 既有端點，未改動，繼續吃 AirportSimPanel 的模擬輸入
   ├─ server/src/routes/detectorRoutes.ts — 新增，Zone/Mask 設定的唯一資料來源
-  └─ client/src/pages/DetectorConfig.tsx — 網頁版 Zone/Mask 編輯器（左側工具列「偵測器後台管理」）
+  └─ client/src/pages/ZoneConfig.tsx     — 網頁版 Zone/Mask 編輯器（左側工具列「偵測器後台管理」）
 ```
 
 **關鍵設計決定**：
