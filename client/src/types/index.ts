@@ -155,6 +155,11 @@ export interface ToastMessage {
   title: string;
   message?: string;
   duration?: number;
+  // Fired when the user explicitly closes this toast via its X button —
+  // e.g. an incursion alert's toast uses this to stop its sound and mark
+  // the eventId locally dismissed (see dismissAlertLocally). Never used to
+  // call a server API directly; that stays a separate, explicit action.
+  onDismiss?: () => void;
 }
 
 // ── Detector config (RIWS-POC integration) ──────────────────────────────────

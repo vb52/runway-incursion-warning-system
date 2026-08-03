@@ -30,6 +30,14 @@ export interface CreateEventInput {
   runway_state?: string;
   taxiway_state_at_detection?: string;
   detected_at?: string;
+  // Client-generated alertEventId (see client/src/stores/
+  // aiDetectionStateStore.ts's buildAlertEventId) that triggered this
+  // detection, if any — carried through purely for audit-trail
+  // traceability (recorded on the timeline entry's metadata below), not
+  // persisted as a dedicated column. The actual idempotency/dedup guarantee
+  // is the existing target_id+taxiway_id+event_type+open-status check just
+  // above; this is additive, not a replacement for it.
+  alertEventId?: string;
 }
 
 export interface CreateTimelineInput {
@@ -103,7 +111,7 @@ class EventService {
           description: `重複偵測到相同目標 ${input.target_id ?? ''} 於 ${input.taxiway_id ?? ''}`,
           source_type: 'SYSTEM',
           occurred_at: detectedAt,
-          metadata: { confidence: input.confidence },
+          metadata: { confidence: input.confidence, alertEventId: input.alertEventId },
         });
         return { event: existing, isNew: false };
       }
@@ -175,6 +183,7 @@ class EventService {
         confidence: input.confidence,
         target_id: input.target_id,
         camera_id: input.camera_id,
+        alertEventId: input.alertEventId,
       },
     });
 

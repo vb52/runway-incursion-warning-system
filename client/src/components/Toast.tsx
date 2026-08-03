@@ -38,7 +38,12 @@ function ToastItem({ toast }: { toast: ToastMessage }) {
         )}
       </div>
       <button
-        onClick={() => removeToast(toast.id)}
+        onClick={() => {
+          // Local-only close — see ToastMessage.onDismiss's comment. Never
+          // triggers a server call; that's a separate, explicit action.
+          toast.onDismiss?.();
+          removeToast(toast.id);
+        }}
         className="text-current opacity-60 hover:opacity-100 transition-opacity flex-shrink-0"
       >
         <X className="w-4 h-4" />

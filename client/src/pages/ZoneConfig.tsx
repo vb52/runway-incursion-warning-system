@@ -70,13 +70,25 @@ import {
 import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
 import { detectorApi, demoApi } from '../services/api';
-import { DetectorConfig, DetectorMotionZone, DetectorRect, ALL_TAXIWAY_IDS } from '../types';
+import { DetectorConfig, DetectorMotionZone, DetectorRect, ALL_TAXIWAY_IDS, TaxiwayId } from '../types';
 import { useVideoSync } from '../hooks/useVideoSync';
 import { useDetectorAlert } from '../hooks/useDetectorAlert';
 import { getSocket } from '../services/socketService';
 import { setDetectorVideoElement } from '../services/detectorVideoRegistry';
 import { useAppStore } from '../stores/appStore';
+import {
+  applyRunwayStateUpdate, broadcastSnapshot, resetGeneration, getCurrentGenerationId, getTiming,
+  computeCanIssueIncursionAlert, buildAlertEventId, isAlertShown, isAlertDismissed, recordServerEventCorrelation,
+  type AiDetectionSnapshot, type AiDetectionEventType, type SystemStatus, type RunwayAlertArmState, type AlertGateState,
+} from '../stores/aiDetectionStateStore';
+import { hasPlayedAlert } from '../services/AudioController';
 
+// Only the TensorFlow.js/COCO-SSD object-detection loop's own interval — a
+// separate, independent detection source (see "1. AI object detection"
+// below) that never touches the aircraft event/animation state machine, only
+// the real-time safety-alert pipeline (reportPlaneDetected). Unrelated to
+// AI_DETECTION_INTERVAL_MS below, which paces the Z1/Z2/Z3 motion pipeline
+// that actually IS the aircraft event state machine's sole input.
 const DETECT_INTERVAL_MS = 500;
 // Lowered from 0.5 — COCO-SSD is a general-purpose model, not trained on
 // airport surveillance footage, and a distant/small airplane in a wide CCTV
@@ -91,6 +103,14 @@ const TRIGGER_COOLDOWN_MS = 20000;
 // long; another detection before it expires extends the window rather than
 // stacking a second timer.
 const RUNWAY_ALERT_DURATION_MS = 30000;
+// Dedicated debounce for the 跑道入侵線 trigger specifically (see
+// reportIncursionLineTrigger) — deliberately its own fixed 30s window,
+// independent of TRIGGER_COOLDOWN_MS/playback rate: operator request is a
+// real-time 30s "only fire once" window, not scaled by video speed. Applies
+// regardless of whether the alert itself later gets manually cleared —
+// lastIncursionTriggerAtRef is only ever reset by RESET/seek, never by
+// clearAlert(), so a cleared alert still can't be immediately re-triggered.
+const INCURSION_LINE_TRIGGER_COOLDOWN_MS = 30000;
 // Motion detection: downscaled frame-diff sample size (perf). The
 // fraction-of-pixels-changed threshold that counts as "something moved" is
 // adjustable at runtime (config.motion_threshold, persisted) — it was a
@@ -102,6 +122,13 @@ const MOTION_SAMPLE_H = 90;
 // Manual marks: timeupdate fires a few times a second, not every frame — a
 // small window around each marked second so a mark isn't missed.
 const TRIGGER_TOLERANCE_S = 0.35;
+// Cadence of the Z1/Z2/Z3 "AI 判讀" pass (see runDetectionTick) — the SOLE
+// producer of the AircraftEventSnapshot the aircraft event state machine
+// consumes. Fixed at once per second per spec, independent of video
+// playback rate. Not to be confused with DETECT_INTERVAL_MS (the separate
+// TensorFlow AI object-detection loop, which never touches the event/
+// animation state machine).
+const AI_DETECTION_INTERVAL_MS = 1000;
 
 const SPEED_OPTIONS = [1, 2, 3, 5];
 
@@ -149,106 +176,162 @@ function nextZoneId(zones: DetectorMotionZone[]): string {
   return `Z${n}`;
 }
 
-// ── 飛機事件狀態機（單一物件，每條聯絡道一台飛機）─────────────────────────
-// Replaces the old independent-latch model (每個判定各自維護自己的
-// latch/streak，RUNWAY_HOLDING 和 TAKEOFF 各自都能在沒有追蹤到飛機時「補
-// spawn」一台) — that's what let a plane's FIRST ever appearance on a taxiway
-// come from RUNWAY_HOLDING or TAKEOFF instead of ENTERING (e.g. Z1's box is
-// brief enough, or physically close enough to Z2's, that the plain-Z1 tick
-// never happens), spawning it directly at/near the runway threshold with no
-// visible taxi run at all, then departing moments later — reads exactly like
-// 「一進跑道就起飛」even though every individual latch was behaving exactly
-// as designed. See AirportSimPanel.spawnAtTaxiway — RUNWAY_HOLDING/TAKEOFF
-// no longer ever create a vehicle, only advance an already-tracked one.
+// ── 飛機事件狀態機（Event-Based，每條聯絡道最多兩個並行事件）───────────────
+// Strict, forward-only per-taxiway state machine, driven exclusively by
+// processAircraftEventSnapshot (the sole state-mutating function — see
+// below) consuming one AircraftEventSnapshot per AI 判讀 pass. Every plane
+// on screen MUST be created by a real Z1 rising edge; Z2 may only advance
+// that SAME plane into the runway-head-entry animation; Z3 is the
+// highest-priority signal — a single valid tick (no confirm-window, no
+// precondition on how far the event has gotten) commits the event to
+// TAKING_OFF immediately, overriding whatever Z1/Z2 would otherwise say.
+// States only ever move forward through this list, never back, and each
+// transition is one-shot (see enteringAnimationStarted/
+// takeoffAnimationStarted) so a signal sustained across many ticks — or a
+// stale/duplicate one arriving late — can never replay an animation or
+// re-derive a transition that already happened.
 //
-// Z1 is now the ONLY thing that may create an event (and therefore, via
-// spawnAtTaxiway's ENTERING branch, the only thing that may cause a new
-// vehicle to appear). Z2/Z3 only ever ADVANCE an existing event; if none
-// exists yet for a taxiway, they're simply ignored — physically, Z2/Z3
-// firing without Z1 ever having been seen means the pipeline missed
-// something, not that a second, independent plane appeared.
-// No separate "Z1 detected, waiting for Z2" state — Z1 creates the event
-// directly in ENTERING_RUNWAY_HEAD (see the tick loop) since stage 1->2 no
-// longer waits for real Z2 evidence, only a short bounded pause on the
-// AirportSimPanel side ("Z1/Z2 停一秒直接進").
+//   WAITING_FOR_Z2        — Z1 created this event; plays the stage-1
+//                            "進入聯絡道" animation once, then genuinely
+//                            idles (no timer/fallback advances it). Only a
+//                            real Z2 (-> ENTERING_RUNWAY_HEAD) or Z3
+//                            (-> TAKING_OFF) ever moves it onward.
+//   ENTERING_RUNWAY_HEAD  — Z2 fired once; plays the stage-2 "進入跑道頭
+//                            等待" animation once. A repeat Z2 hit here is a
+//                            pure no-op.
+//   HOLDING_AT_RUNWAY_HEAD— AirportSimPanel reported the stage-2 animation
+//                            actually reached the runway head
+//                            (entryAnimationCompleted). Frozen indefinitely;
+//                            nothing but Z3 ever moves it onward.
+//   TAKING_OFF            — Z3 fired (from ANY prior state). Plays the real
+//                            takeoff animation once. Removed from tracking
+//                            entirely once AirportSimPanel reports the
+//                            takeoff animation finished ('sim:aircraft-
+//                            departed', see the listener below) — that's
+//                            "COMPLETED" in spec terms.
 //
-// UP TO TWO concurrent events per taxiway (operator request: "支援兩台，Z1
-// 直接開第二個就好") — a real Z1 hit while an existing event is still
-// ENTERING_RUNWAY_HEAD (not yet physically at the runway head) is almost
-// certainly the SAME plane and is ignored, same as before; but once that
-// event reaches HOLDING_AT_RUNWAY_HEAD or TAKING_OFF — meaning it's
-// physically clear of Z1's zone, since a plane can't be at Z1 and at/near
-// the runway head simultaneously — a new Z1 hit unambiguously means a
-// SECOND, independent plane, and gets its own event. This structurally
-// caps concurrency to at most one event still "in transit" (ENTERING_
-// RUNWAY_HEAD, entryAnimationCompleted false) plus at most one "ahead"
-// event (HOLDING_AT_RUNWAY_HEAD or TAKING_OFF) at a time — see the tick
-// loop's creation check. Z2/Z3 raw hits are single per-tick signals (not
-// tied to a specific vehicle by the video itself), so they're targeted at
-// whichever event's STATE makes it the sensible recipient (the in-transit
-// one for Z2's catch-up effect, the holding one for Z3) rather than by an
-// explicit id — see the tick loop and evaluateTakeoff.
-type AircraftEventState = 'ENTERING_RUNWAY_HEAD' | 'HOLDING_AT_RUNWAY_HEAD' | 'TAKING_OFF';
+// UP TO TWO concurrent events per taxiway — a new Z1 rising edge may only
+// create a second one once EVERY existing event for this taxiway has
+// already reached TAKING_OFF (checked AFTER Z3 is processed this same
+// pass, so a same-pass "Z3 confirms the existing plane is departing AND Z1
+// detects a new one" combo is honored as two different planes, not
+// blocked). Before that point, a repeat Z1 hit is entirely ignored — it
+// neither creates a new event nor affects the existing one. See
+// processAircraftEventSnapshot's blocking check.
+type AircraftEventState =
+  | 'WAITING_FOR_Z2' | 'ENTERING_RUNWAY_HEAD' | 'HOLDING_AT_RUNWAY_HEAD' | 'TAKING_OFF';
 
 const AIRCRAFT_STATE_LABELS: Record<AircraftEventState, string> = {
+  WAITING_FOR_Z2: '等待Z2進入跑道頭',
   ENTERING_RUNWAY_HEAD: '前往跑道頭',
   HOLDING_AT_RUNWAY_HEAD: '跑道頭等待',
   TAKING_OFF: '起飛',
 };
 
+// Monotonically increasing, unique across the whole page (not per-taxiway) —
+// gives every event a stable id passed through to
+// AirportSimPanel.spawnAtTaxiway (see emitSpawn) so it can dedup/target by
+// identity instead of only by phase/timing heuristics.
+let eventIdCounter = 0;
+
 // Held in activeAircraftEventsRef as Map<taxiwayId, AircraftEvent[]> (see
-// that ref's declaration) — up to two entries per taxiway, see
+// that ref's declaration) — at most ONE entry per taxiway (array shape kept
+// only so "no active event" is a uniform empty array), see
 // AircraftEventState's comment. entryAnimationCompleted is NOT decided in
 // this file — it's reported back by AirportSimPanel via
 // 'sim:aircraft-at-runway-head' once the tracked vehicle's OWN animation
 // actually reaches the runway-head position, since that's real animation-
-// timing knowledge only that component has. Takeoff is gated on that flag
-// specifically so it can never start while the entering animation is still
-// visibly playing — see evaluateTakeoff below for the "Z3 confirms early,
-// deferred until entry finishes" case.
+// timing knowledge only that component has. It only gates the NORMAL
+// (non-Z3-preempted) transition into HOLDING_AT_RUNWAY_HEAD — Z3 does not
+// wait on it at all. enteringAnimationStarted/takeoffAnimationStarted are
+// one-shot guards: once true, that transition/spawn-command can never fire
+// again for this event, regardless of how many more ticks the triggering
+// zone stays hit.
 interface AircraftEvent {
+  id: string;
   state: AircraftEventState;
-  entryAnimationPlayed: boolean;
   entryAnimationCompleted: boolean;
-  z3MotionFrameCount: number;
-  z3MotionConfirmed: boolean;
-  takeoffAnimationPlayed: boolean;
+  enteringAnimationStarted: boolean;
+  takeoffAnimationStarted: boolean;
 }
 
-// Consecutive detection ticks (DETECT_INTERVAL_MS apart) Z3 must hold before
-// its motion counts as confirmed — one noisy frame is never enough on its
-// own to start a takeoff. 3 ticks @ 500ms = 1.5s. Only ever accumulated once
-// the plane has ACTUALLY, physically arrived at the runway head
-// (entryAnimationCompleted — see the tick loop) — Z3 motion before that, or
-// with no active event for that taxiway at all, means nothing and starts
-// nothing. Even once confirmed, evaluateTakeoff still separately requires
-// state === HOLDING_AT_RUNWAY_HEAD before it actually starts a takeoff.
-const Z3_MOTION_CONFIRM_FRAMES = 3;
+// ── AI 判讀 Snapshot ──────────────────────────────────────────────────────
+// Raw per-taxiway Z1/Z2/Z3 judgment for a SINGLE AI analysis pass (see
+// runDetectionTick) — deliberately kept separate from AircraftEvent (the
+// derived, persistent state machine). Rebuilt fresh every
+// AI_DETECTION_INTERVAL_MS; never itself mutated after creation, and never
+// itself cancels/reverts an already-created AircraftEvent just because the
+// next pass's motion reads false again — only rising edges, processed by
+// processAircraftEventSnapshot, ever change event state.
+interface ZoneJudgment {
+  z1Motion: boolean;
+  z2Motion: boolean;
+  z3Triggered: boolean;
+  confidence: number; // raw frame-diff score behind this pass's judgment
+}
 
-// Per-event debug fields shown in the debug panel below — one taxiway can
-// hold up to two concurrent AircraftEvents (see activeAircraftEventsRef's
-// comment), so this is nested inside RunwayDebugSnapshot as an array rather
-// than being flattened into it directly.
+// One complete AI analysis pass, across every taxiway — the SOLE input to
+// processAircraftEventSnapshot, and the SOLE source of what "偵測區域設定"
+// displays as the current AI 判讀狀況, so the two can never show/use
+// different data. analysisRequestId/analysisTimestamp identify which pass
+// produced a given result — used to make sure a superseded (e.g.
+// seek-invalidated) pass's result can never be applied after a newer one.
+interface AircraftEventSnapshot {
+  analysisRequestId: number;
+  analysisTimestamp: number;
+  taxiways: Map<string, ZoneJudgment>;
+}
+
+// Per-event debug fields shown in the debug panel below.
 interface AircraftEventDebug {
   state: AircraftEventState;
   entryAnimationCompleted: boolean;
-  z3MotionFrameCount: number;
-  z3MotionConfirmed: boolean;
-  takeoffAnimationPlayed: boolean;
   eventReason: string;
 }
 
-// Debug snapshot of the last tick's judgment per taxiway — surfaced in the
-// debug panel below. z1/z2/z3 are this tick's raw zone hits (there's no
-// separate multi-object tracker with its own IDs in this system — one
-// frame-diff score vs threshold per zone is the only signal).
+// Debug snapshot of the last AI 判讀 pass's judgment AND its effect on the
+// event state machine for one taxiway — surfaced in the debug panel below.
+// z1Motion/z2Motion/z3Triggered/analysisTimestamp are read directly off the
+// same AircraftEventSnapshot processAircraftEventSnapshot consumed (never
+// separately recomputed), so this panel can never show a different reading
+// than what actually drove the animation. `events` holds up to two entries
+// — see activeAircraftEventsRef's comment on the concurrency cap.
 interface RunwayDebugSnapshot {
+  analysisTimestamp: number;
   motionScore: number;
   motionThreshold: number;
-  z1: boolean;
-  z2: boolean;
-  z3: boolean;
+  z1Motion: boolean;
+  z2Motion: boolean;
+  z3Triggered: boolean;
+  transitioned: boolean;
+  currentAnimation: string;
   events: AircraftEventDebug[];
+  // The exact AiDetectionSnapshot just published to aiDetectionStateStore
+  // for this taxiway this pass — surfaced so the debug panel can show
+  // eventId/sequence/generationId/source/status/decision alongside the
+  // Local UI/Server round-trip latency (see aiDetectionStateStore's
+  // getTiming), all read from the SAME store LiveMonitor subscribes to.
+  aiSnapshot: AiDetectionSnapshot | null;
+  // ── Incursion-alert Gate + dedup debug (see computeCanIssueIncursionAlert
+  // and buildAlertEventId in aiDetectionStateStore.ts) ────────────────────
+  systemStatus: SystemStatus;
+  monitoringEnabled: boolean;
+  runwayAlertState: RunwayAlertArmState;
+  canIssueIncursionAlert: boolean;
+  // The stable aircraft-event id (or synthetic incursion-line-only
+  // placeholder) this pass's alertEventId, if any, was built from.
+  aircraftEventId: string | null;
+  // Only set when this pass's eventType is genuinely 'INCURSION' — the
+  // composed generationId:aircraftEventId:taxiwayId:alertType string.
+  alertEventId: string | null;
+  alertAlreadyShown: boolean;
+  alertSoundAlreadyPlayed: boolean;
+  alertDismissed: boolean;
+  serverIncursionLatched: boolean;
+  // Human-readable reason no NEW alert fired this pass — 'ALERT_ISSUED' when
+  // one legitimately did. Read directly off the same decision this pass
+  // already made, never separately re-derived.
+  noAlertReason: string;
 }
 
 // Below this, a native `seeking` event is treated as useVideoSync's own
@@ -333,6 +416,47 @@ export function ZoneConfigPage() {
   const { state: appState } = useAppStore();
   const liveEnabledRef = useRef(appState.liveEnabled);
   useEffect(() => { liveEnabledRef.current = appState.liveEnabled; }, [appState.liveEnabled]);
+
+  // ── Incursion-alert Gate inputs (see aiDetectionStateStore's module doc) ─
+  // Kept in refs (not read from appState directly inside the detect
+  // loops/reportIncursionLineTrigger) for the same reason as liveEnabledRef
+  // above — a systemState change shouldn't need to restart those
+  // effects/callbacks. systemStatusRef/runwayArmedRef mirror the server's
+  // powerState/runwayProtectionState; monitoringEnabled (LIVE toggle AND the
+  // video actually playing, not paused/ended) is read fresh at call time
+  // since it can change moment-to-moment without a React re-render.
+  const systemStatusRef = useRef<SystemStatus>('STOPPED');
+  const runwayArmedRef = useRef<RunwayAlertArmState>('DISARMED');
+  useEffect(() => {
+    const ps = appState.systemState?.powerState;
+    systemStatusRef.current = ps === 'ACTIVE' ? 'RUNNING' : ps === 'INITIALIZING' ? 'INITIALIZING' : 'STOPPED';
+    runwayArmedRef.current = appState.systemState?.runwayProtectionState === 'ON' ? 'ARMED' : 'DISARMED';
+  }, [appState.systemState?.powerState, appState.systemState?.runwayProtectionState]);
+
+  // The ONE gate every incursion-warning entry point (local popup, sound,
+  // backend detect call, Socket.IO broadcast) must pass — see
+  // computeCanIssueIncursionAlert's comment. Deliberately does NOT gate
+  // processAircraftEventSnapshot/the ground-sim animation state machine;
+  // those keep updating off raw AI 判讀 regardless of whether an alert is
+  // allowed to fire.
+  // Exposes the raw Gate components (not just the combined boolean) so the
+  // debug panel can show exactly which condition is blocking an alert, using
+  // the SAME read canIssueIncursionAlertNow uses — never a separately
+  // re-derived approximation.
+  const getAlertGateState = useCallback((): AlertGateState => {
+    const video = videoRef.current;
+    const monitoringEnabled = liveEnabledRef.current
+      && !!video && !video.paused && !video.ended && video.readyState >= 2;
+    return {
+      systemStatus: systemStatusRef.current,
+      monitoringEnabled,
+      runwayAlertState: runwayArmedRef.current,
+    };
+  }, []);
+
+  const canIssueIncursionAlertNow = useCallback((): boolean => {
+    return computeCanIssueIncursionAlert(getAlertGateState());
+  }, [getAlertGateState]);
 
   // This page is always mounted regardless of route (see Layout.tsx), so
   // useLocation here reflects whether it's actually the visible page, not
@@ -532,6 +656,13 @@ export function ZoneConfigPage() {
 
     const resolvedTaxiwayId = taxiwayId ?? taxiwayIdRef.current;
 
+    // MUST be awaited before demoApi.detect fires, not run concurrently —
+    // armRunwayAlert is the single gate that decides whether the system is
+    // actually armed (STM ACTIVE + RWY protection ON) before demoApi.detect
+    // is allowed to land; firing both at once risked demoApi.detect arriving
+    // first and being silently bailed by the backend
+    // (SimulationEngine.processDetection requires STM ACTIVE) while still
+    // consuming this detection's cooldown slot.
     await armRunwayAlert(mayCreateAlert);
     demoApi.detect({
       taxiway_id: resolvedTaxiwayId,
@@ -550,6 +681,63 @@ export function ZoneConfigPage() {
     // AirportSimPanel.spawnAtTaxiway), which this per-zone, per-call
     // function can't see on its own.
   }, [armRunwayAlert]);
+
+  // Date.now() ms of the last incursion-line trigger — deliberately
+  // separate from lastTriggerAtRef/TRIGGER_COOLDOWN_MS (see
+  // INCURSION_LINE_TRIGGER_COOLDOWN_MS's comment). Only ever reset by
+  // resetTemporalDetectionState (RESET/seek/demo-reset) — clearAlert()
+  // (manually dismissing the current alert) does NOT touch this, so a
+  // cleared alert still can't be immediately re-triggered within the 30s
+  // window.
+  const lastIncursionTriggerAtRef = useRef(0);
+
+  // Dedicated, direct trigger path for the 跑道入侵線 specifically — kept
+  // separate from reportPlaneDetected (which serves the Z1/Z2/Z3/AI/manual
+  // sources and their own per-zone cooldown/mayCreateAlert semantics) so
+  // there's no indirection or shared state that could delay or suppress an
+  // incursion-line hit: it fires the moment the line's score crosses
+  // threshold, gated only by its own INCURSION_LINE_TRIGGER_COOLDOWN_MS.
+  // Still awaits armRunwayAlert before demoApi.detect for the same
+  // correctness reason as reportPlaneDetected (STM/RWY must actually be
+  // ACTIVE by the time the backend sees the detection, or it's silently
+  // dropped).
+  const reportIncursionLineTrigger = useCallback(async (
+    confidence: number, taxiwayId: string, snapshotBase64: string | undefined, alertEventId: string,
+  ) => {
+    // The Gate, re-checked HERE (not just trusted from the caller) — every
+    // entry point that can create/write a real alert must pass it itself,
+    // per the operator's explicit "禁止任何 callback 繞過檢查直接觸發警告".
+    // The caller only ever invokes this when publishAiDetectionSnapshot's
+    // own Gate-aware classification already read INCURSION, but a mid-flight
+    // Gate flip (e.g. operator stops STM between that read and this async
+    // call) must still be caught here.
+    if (!canIssueIncursionAlertNow()) return;
+    const now = Date.now();
+    if (now - lastIncursionTriggerAtRef.current < INCURSION_LINE_TRIGGER_COOLDOWN_MS) return;
+    lastIncursionTriggerAtRef.current = now;
+    setTriggerCount((c) => c + 1);
+    setLastDetection({ score: confidence, at: new Date().toLocaleTimeString('zh-TW', { hour12: false }), source: 'DETECTOR-INCURSION-LINE' });
+
+    await armRunwayAlert();
+    demoApi.detect({
+      taxiway_id: taxiwayId,
+      target_type: 'AIRCRAFT',
+      confidence,
+      entering_runway: true,
+      camera_id: 'DETECTOR-INCURSION-LINE',
+      snapshot_base64: snapshotBase64,
+      alert_event_id: alertEventId,
+    }).then((res) => {
+      // Correlate the server's own event id back to OUR alertEventId so
+      // useSocket.ts's onEventCreated can recognize "this is the SAME alert
+      // I already showed" by exact id match instead of a recency guess —
+      // see recordServerEventCorrelation's comment.
+      const serverEventId = res.data?.eventId;
+      if (serverEventId) recordServerEventCorrelation(serverEventId, alertEventId);
+    }).catch(() => {
+      // Can still fail (e.g. RWY enable itself failed) — stay quiet.
+    });
+  }, [armRunwayAlert, canIssueIncursionAlertNow]);
 
   // ── 1. AI object detection (TensorFlow.js + COCO-SSD) ───────────────────
   useEffect(() => {
@@ -617,6 +805,10 @@ export function ZoneConfigPage() {
       drawOverlay(planes);
 
       if (planes.length === 0) return;
+      // Gate — rawPredictions/the overlay boxes above still update
+      // regardless (that's just a visual debug aid, not an alert); only the
+      // real alert/backend-detection pair below is gated.
+      if (!canIssueIncursionAlertNow()) return;
       const best = planes.reduce((a, b) => (a.score > b.score ? a : b));
       // Reset the runway alert window on every tick a plane is still visible,
       // not just when reportPlaneDetected's cooldown lets a new event through
@@ -629,7 +821,7 @@ export function ZoneConfigPage() {
 
     const intervalId = setInterval(tick, DETECT_INTERVAL_MS);
     return () => clearInterval(intervalId);
-  }, [modelStatus, aiEnabled, isVisible, drawOverlay, reportPlaneDetected, armRunwayAlert]);
+  }, [modelStatus, aiEnabled, isVisible, drawOverlay, reportPlaneDetected, armRunwayAlert, canIssueIncursionAlertNow]);
 
   // ── 2. Motion detection (frame-diff, independent of the AI model) ───────
   const motionCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -645,17 +837,47 @@ export function ZoneConfigPage() {
   // a hit (real snapshot, no ground-sim projection).
   const incursionLineRef = useRef<DetectorMotionZone | null>(null);
   // Up to two AircraftEvents per taxiway currently tracking a plane (see
-  // AircraftEventState's comment) — the single source of truth the tick loop
-  // below reads and mutates. All reset together whenever zones are redrawn,
-  // since an event built against the old zone layout isn't meaningful once
-  // the rects (and what they mean) have changed.
+  // AircraftEventState's comment) — the single source of truth
+  // processAircraftEventSnapshot reads and mutates. All reset together
+  // whenever zones are redrawn, since an event built against the old zone
+  // layout isn't meaningful once the rects (and what they mean) have
+  // changed.
   const activeAircraftEventsRef = useRef<Map<string, AircraftEvent[]>>(new Map());
+  // Previous AI 判讀 pass's raw Z1/Z2/Z3 hit state per taxiway — rising-edge
+  // detection (false -> true transition only, never "still hit") is what
+  // actually drives event creation/advancement, so a signal sustained
+  // across many passes fires its one relevant transition exactly once
+  // instead of repeating it every pass.
+  const prevZoneHitsRef = useRef<Map<string, { z1: boolean; z2: boolean; z3: boolean }>>(new Map());
+  // Identifies which AI 判讀 pass produced a given result — bumped at the
+  // start of every pass AND on every seek (invalidating whatever pass, if
+  // any, was in flight). analysisInProgressRef guards against two passes
+  // ever running concurrently (runDetectionTick is synchronous today so
+  // this can't actually happen yet, but guards the invariant regardless —
+  // if a scheduled pass finds one still "in progress" it skips rather than
+  // overlapping).
+  const analysisRequestIdRef = useRef(0);
+  const analysisInProgressRef = useRef(false);
+  // Monotonic per-taxiway sequence for the local-first AiDetectionSnapshot
+  // published to aiDetectionStateStore each pass — see
+  // publishAiDetectionSnapshot below. Incremented on EVERY publish for that
+  // taxiway regardless of content change, so the store's stale-sequence
+  // guard has something meaningful to compare against.
+  const aiSnapshotSequenceRef = useRef<Map<string, number>>(new Map());
+  // Stable eventId per taxiway for the CURRENT detection "incident" — reuses
+  // the taxiway's active AircraftEvent id when the Z1/Z2/Z3 machine has one
+  // (naturally correlating the ground-sim event and the AI-detection
+  // snapshot for the same plane); falls back to a locally-generated id when
+  // only the incursion line fired with no aircraft event tracked. Cleared on
+  // reset/seek along with everything else.
+  const aiSnapshotEventIdRef = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
     motionZonesRef.current = config?.motion_zones ?? [];
     incursionLineRef.current = config?.incursion_line ?? null;
     prevFramesRef.current = new Map(); // zone set/rects changed — old baselines no longer comparable
     activeAircraftEventsRef.current = new Map();
+    prevZoneHitsRef.current = new Map();
   }, [config?.motion_zones, config?.incursion_line]);
 
   // ── 事件判定/debug 面板顯示狀態 ────────────────────────────────────────
@@ -678,10 +900,10 @@ export function ZoneConfigPage() {
   // useVideoSync's catch-up correction, or the video's own `loop` wrap), so
   // there's no need to separately intercept each call site.
   const isSeekingRef = useRef(false);
-  // Bumped on every `seeking` — the seek-reanalysis burst (see runSeekBurst)
-  // checks this before each step, so a second seek arriving before the first
-  // one's reanalysis finished makes the stale burst abandon itself instead of
-  // racing the new one.
+  // Bumped on every `seeking` — handleVideoSeeked checks this before applying
+  // its immediate post-seek analysis result, so a second seek arriving
+  // before the first one's analysis finished makes the stale one's result
+  // abandoned instead of racing the new one.
   const seekRequestIdRef = useRef(0);
   const [analysisStatus, setAnalysisStatus] = useState<'IDLE' | 'REANALYZING'>('IDLE');
   const [seekDebug, setSeekDebug] = useState<{ seekRequestId: number; targetTime: number } | null>(null);
@@ -693,7 +915,12 @@ export function ZoneConfigPage() {
   const resetTemporalDetectionState = useCallback(() => {
     prevFramesRef.current = new Map();          // 舊的 Motion 狀態（frame-diff baseline）
     activeAircraftEventsRef.current = new Map(); // 舊的飛機事件狀態機（每條聯絡道）
+    prevZoneHitsRef.current = new Map();        // 舊的 Z1/Z2/Z3 rising-edge 追蹤
     lastTriggerAtRef.current = new Map();       // 舊的事件 Cooldown
+    lastIncursionTriggerAtRef.current = 0;      // 舊的入侵線 Cooldown
+    aiSnapshotSequenceRef.current = new Map();  // 舊的 AiDetectionSnapshot sequence
+    aiSnapshotEventIdRef.current = new Map();   // 舊的 AiDetectionSnapshot eventId 對應
+    resetGeneration();                          // 讓 LiveMonitor 端的 local-first store 也失效舊資料
     setCurrentStatus(null);                     // 舊的 Icon
     setRunwayDebug({});
   }, []);
@@ -712,14 +939,41 @@ export function ZoneConfigPage() {
     const jump = Math.abs(newTime - lastVideoTimeRef.current);
     if (jump < SMALL_SEEK_IGNORE_S) return;
 
+    // <video loop> wrapping back to 0 fires this exact same native
+    // `seeking` event but is NOT a real seek — the operator didn't ask to
+    // jump anywhere, the demo clip is just repeating. Per the operator's
+    // spec, only an actual seek (dragging the bar, clicking a new time) may
+    // clear in-flight aircraft events/vehicles; a loop wrap must not
+    // interrupt an in-progress Z1->Z2->takeoff sequence just because it's
+    // still running when the clip happens to repeat (animations can now
+    // take 30s+ end to end, so this is a real, frequent case, not a rare
+    // edge case). Detected as: jumped backward, landed near the very start,
+    // coming from near the very end. Only the frame-diff baselines/
+    // rising-edge tracking get reset — the OLD end-of-clip frame vs the NEW
+    // start-of-clip frame is a real discontinuity that must not be misread
+    // as motion — activeAircraftEventsRef and the ground-sim vehicles it
+    // drives are deliberately left untouched.
+    const isLoopWrap = newTime < lastVideoTimeRef.current
+      && newTime < SMALL_SEEK_IGNORE_S
+      && (duration === 0 || lastVideoTimeRef.current > duration - SMALL_SEEK_IGNORE_S);
+    if (isLoopWrap) {
+      prevFramesRef.current = new Map();
+      prevZoneHitsRef.current = new Map();
+      return;
+    }
+
     isSeekingRef.current = true;
     seekRequestIdRef.current += 1;
+    // 讓任何仍在進行中（或已排程）的舊 AI 判讀失效，並清除舊的暫存 Snapshot
+    // 狀態——見 handleVideoSeeked，新影格載入完成後會立即重新判讀一次。
+    analysisRequestIdRef.current += 1;
+    analysisInProgressRef.current = false;
     resetTemporalDetectionState();
     setAnalysisStatus('REANALYZING');
     // 舊的 Track 暫存狀態 — tells AirportSimPanel to drop any LIVE-tracked
     // vehicle and stop whatever animation (起飛/等待) it was mid-playing.
     getSocket().emit('detector:video-seeking');
-  }, [resetTemporalDetectionState]);
+  }, [resetTemporalDetectionState, duration]);
 
   // Server-broadcast when an operator explicitly resets the demo scene (see
   // DetectorAlertService.notifyDemoReset) — one of the few things allowed to
@@ -730,11 +984,19 @@ export function ZoneConfigPage() {
     const socket = getSocket();
     const onDemoReset = () => {
       resetTemporalDetectionState();
+      // RESET 時影片從頭播放 — operator request. Native onSeeking/onSeeked
+      // on the <video> below will also fire from this and run their own
+      // (redundant but harmless) reset/reanalysis; this call itself is what
+      // actually moves playback back to 0.
+      if (videoRef.current) {
+        videoRef.current.currentTime = 0;
+        publish(playbackRateRef.current, 0);
+      }
       socket.emit('detector:video-seeking');
     };
     socket.on('detector:demo-reset', onDemoReset);
     return () => { socket.off('detector:demo-reset', onDemoReset); };
-  }, [resetTemporalDetectionState]);
+  }, [resetTemporalDetectionState, publish]);
 
   // Scores one zone's rect against its own running baseline. Reuses a single
   // shared canvas across zones/ticks (sequential draws — cheap, no need for
@@ -792,112 +1054,61 @@ export function ZoneConfigPage() {
     }
   }, []);
 
-  // Extracted from the interval effect below (not just an inline closure) so
-  // handleVideoSeeked's reanalysis burst can also call it directly, several
-  // times in quick succession, to rebuild z3Triggered/event confirmation
-  // faster than waiting out DETECT_INTERVAL_MS-paced ticks. Calling it more
-  // than once close together (interval tick + burst overlapping) is safe —
-  // it always just samples whatever the CURRENT frame is against whatever
-  // baseline is currently stored, nothing here is order- or timing-sensitive
-  // beyond that.
-  const emitSpawn = useCallback((taxiwayId: string, event: 'TAKEOFF' | 'RUNWAY_HOLDING' | 'ENTERING') => {
-    getSocket().emit('sim:spawn-at-taxiway', { taxiway_id: taxiwayId, event });
+  // Every emit carries the event's own id (see eventIdCounter) so
+  // AirportSimPanel can target/dedup by identity — belt-and-suspenders
+  // alongside this file's own one-shot flags (enteringAnimationStarted/
+  // takeoffAnimationStarted), which already guarantee each of these fires at
+  // most once per event on this side.
+  const emitSpawn = useCallback((taxiwayId: string, event: 'TAKEOFF' | 'RUNWAY_HOLDING' | 'ENTERING', eventId: string) => {
+    getSocket().emit('sim:spawn-at-taxiway', { taxiway_id: taxiwayId, event, event_id: eventId });
   }, []);
-
-  // Starts TAKING_OFF for whichever of this taxiway's events is holding at
-  // the runway head and has every precondition met — called both from the
-  // tick loop (right after updating Z3's confirmation streak) and from
-  // maybeEnterHolding below (the case where Z3 motion confirmed WHILE the
-  // entry animation was still playing: z3MotionConfirmed gets recorded
-  // early, but entryAnimationCompleted was still false, so nothing fired
-  // yet — once it flips true, this same check now passes). At most one
-  // event should ever be HOLDING_AT_RUNWAY_HEAD at a time (see
-  // AircraftEventState's comment on the concurrency cap), so `find` rather
-  // than iterating all matches is intentional, not a shortcut. Safe to call
-  // unconditionally; no-ops unless every condition holds. This is the ONLY
-  // place a TAKEOFF spawn is ever emitted.
-  const evaluateTakeoff = useCallback((taxiwayId: string) => {
-    const events = activeAircraftEventsRef.current.get(taxiwayId);
-    if (!events) return;
-    const event = events.find((e) =>
-      e.state === 'HOLDING_AT_RUNWAY_HEAD' &&
-      e.entryAnimationCompleted &&
-      e.z3MotionConfirmed &&
-      !e.takeoffAnimationPlayed
-    );
-    if (event) {
-      event.state = 'TAKING_OFF';
-      event.takeoffAnimationPlayed = true;
-      emitSpawn(taxiwayId, 'TAKEOFF');
-    }
-  }, [emitSpawn]);
-
-  // entryAnimationCompleted (AirportSimPanel's own vehicle animation
-  // actually reached the runway-head position — see simStep's TAXI_OUT/
-  // TAXI_TO_HEAD cases) is real animation-timing evidence only that
-  // component has; this side's own state (ENTERING_RUNWAY_HEAD from the
-  // moment Z1 creates the event, per "Z1/Z2 停一秒直接進") isn't a reliable
-  // proxy for "has it actually arrived" anymore. HOLDING_AT_RUNWAY_HEAD may
-  // only start once entryAnimationCompleted is confirmed true — takes the
-  // specific event directly (found by the caller — see onArrived below,
-  // the only caller) rather than re-deriving which one, since with up to
-  // two events per taxiway "the one that just reported arrival" isn't
-  // otherwise recoverable from the taxiway id alone.
-  const maybeEnterHolding = useCallback((taxiwayId: string, event: AircraftEvent) => {
-    if (
-      event.entryAnimationCompleted &&
-      event.state !== 'HOLDING_AT_RUNWAY_HEAD' &&
-      event.state !== 'TAKING_OFF'
-    ) {
-      event.state = 'HOLDING_AT_RUNWAY_HEAD';
-      evaluateTakeoff(taxiwayId);
-    }
-  }, [evaluateTakeoff]);
 
   // AirportSimPanel reports back once a LIVE-tracked vehicle's own animation
   // actually reaches the runway-head position — this is the only place
-  // entryAnimationCompleted may become true, since only that component
-  // knows when its own animation has actually finished. The vehicle that
-  // just arrived can only be the "in transit" one — the only event that's
-  // still ENTERING_RUNWAY_HEAD with entryAnimationCompleted still false;
-  // structurally there's at most one such event per taxiway at a time (see
-  // AircraftEventState's concurrency-cap comment), so finding it this way
-  // is unambiguous without needing an explicit per-vehicle id. Ignored if no
-  // such event exists (e.g. a seek already cleared it, or a stale/duplicate
-  // signal after it was already recorded).
+  // entryAnimationCompleted may become true, since only that component knows
+  // when its own animation has actually finished. Matched by event_id when
+  // present (AirportSimPanel threads it through from the ENTERING spawn),
+  // falling back to "the one still ENTERING_RUNWAY_HEAD with
+  // entryAnimationCompleted still false" for safety. Only advances state if
+  // the event is still ENTERING_RUNWAY_HEAD — if Z3 already force-advanced it
+  // to TAKING_OFF in the meantime, entryAnimationCompleted is still recorded
+  // (useful for the debug panel) but must NOT move the state sideways/back.
   useEffect(() => {
     const socket = getSocket();
-    const onArrived = (data: { taxiway_id?: string }) => {
+    const onArrived = (data: { taxiway_id?: string; event_id?: string }) => {
       if (typeof data?.taxiway_id !== 'string') return;
       const events = activeAircraftEventsRef.current.get(data.taxiway_id);
-      const event = events?.find((e) => e.state !== 'TAKING_OFF' && !e.entryAnimationCompleted);
+      const event = events?.find((e) => e.id === data.event_id)
+        ?? events?.find((e) => e.state === 'ENTERING_RUNWAY_HEAD' && !e.entryAnimationCompleted);
       if (!event) return;
       event.entryAnimationCompleted = true;
-      maybeEnterHolding(data.taxiway_id, event);
+      if (event.state === 'ENTERING_RUNWAY_HEAD') {
+        event.state = 'HOLDING_AT_RUNWAY_HEAD';
+      }
     };
     socket.on('sim:aircraft-at-runway-head', onArrived);
     return () => { socket.off('sim:aircraft-at-runway-head', onArrived); };
-  }, [maybeEnterHolding]);
+  }, []);
 
   // AirportSimPanel reports back once a LIVE-tracked vehicle's takeoff
-  // animation actually completes (simState -> 'DONE') — removes JUST that
-  // one event from this taxiway's array (not the whole taxiway — the other
-  // slot, if any, may still have a second plane mid-sequence) so a LATER,
-  // genuinely new Z1 detection can start a fresh event instead of being
-  // permanently blocked for the rest of the session. At most one event
-  // should ever be TAKING_OFF at a time (see AircraftEventState's
-  // concurrency-cap comment), so removing all TAKING_OFF entries is
-  // equivalent to removing the one that just departed. Per the operator's
-  // spec, an event may only ever be removed by: this (takeoff animation
-  // completing), RESET, a video seek, or a demo reset — never by a timer,
-  // and never just because Z1/Z2/Z3 signals momentarily drop out.
+  // animation actually completes (simState -> 'DONE') — clears this
+  // taxiway's event entirely so a LATER, genuinely new Z1 detection can
+  // start a fresh one instead of being permanently blocked for the rest of
+  // the session (only one active event is ever allowed per taxiway — see
+  // AircraftEventState's comment). Matched by event_id when present,
+  // falling back to "clear whatever's TAKING_OFF" for safety. Per the
+  // operator's spec, an event may only ever be removed by: this (takeoff
+  // animation completing), RESET, a video seek, or a demo reset — never by
+  // a timer, and never just because Z1/Z2/Z3 signals momentarily drop out.
   useEffect(() => {
     const socket = getSocket();
-    const onDeparted = (data: { taxiway_id?: string }) => {
+    const onDeparted = (data: { taxiway_id?: string; event_id?: string }) => {
       if (typeof data?.taxiway_id !== 'string') return;
       const events = activeAircraftEventsRef.current.get(data.taxiway_id);
       if (!events) return;
-      const remaining = events.filter((e) => e.state !== 'TAKING_OFF');
+      const remaining = data.event_id
+        ? events.filter((e) => e.id !== data.event_id)
+        : events.filter((e) => e.state !== 'TAKING_OFF');
       if (remaining.length > 0) activeAircraftEventsRef.current.set(data.taxiway_id, remaining);
       else activeAircraftEventsRef.current.delete(data.taxiway_id);
     };
@@ -905,7 +1116,262 @@ export function ZoneConfigPage() {
     return () => { socket.off('sim:aircraft-departed', onDeparted); };
   }, []);
 
+  // ── 唯一的 Event-Based 狀態機 ────────────────────────────────────────────
+  // The SOLE function allowed to create/advance/mutate AircraftEvents.
+  // Everything else (detection loops, timeupdate, requestAnimationFrame,
+  // React render, zone callbacks, the alarm pipeline) may only ever produce
+  // an AircraftEventSnapshot and hand it to this function — never spawn a
+  // plane or drive an animation directly. Pure with respect to its input
+  // (only reads `snapshot` and `activeAircraftEventsRef`/`liveEnabledRef`),
+  // its only side effects are mutating activeAircraftEventsRef and calling
+  // emitSpawn/armRunwayAlert — both already idempotent/one-shot-guarded.
+  // Priority fixed every pass: Z3 (TAKING_OFF, highest) > Z2
+  // (ENTERING_RUNWAY_HEAD) > Z1 (NEW event) > none — checked in that exact
+  // order so a same-pass "Z3 frees the taxiway AND Z1 fires" combo resolves
+  // correctly. Returns per-taxiway debug info (did a transition happen this
+  // pass, what animation is the event currently playing) so the debug panel
+  // can display EXACTLY what this function used/decided, never a separately
+  // recomputed reading.
+  const processAircraftEventSnapshot = useCallback((snapshot: AircraftEventSnapshot) => {
+    const results = new Map<string, { transitioned: boolean; currentAnimation: string }>();
+    for (const [taxiwayId, judgment] of snapshot.taxiways) {
+      let transitioned = false;
+      const prevHits = prevZoneHitsRef.current.get(taxiwayId) ?? { z1: false, z2: false, z3: false };
+      const z1Rising = judgment.z1Motion && !prevHits.z1;
+      const z2Rising = judgment.z2Motion && !prevHits.z2;
+      const z3Rising = judgment.z3Triggered && !prevHits.z3;
+      prevZoneHitsRef.current.set(taxiwayId, { z1: judgment.z1Motion, z2: judgment.z2Motion, z3: judgment.z3Triggered });
+
+      // The entire event state machine freezes while LIVE is off — mirrors
+      // AirportSimPanel.spawnAtTaxiway's own LIVE gate exactly, so the two
+      // sides can never desync (an event advancing here with no vehicle on
+      // screen to reflect it, since AirportSimPanel would silently drop the
+      // spawn command — this is what previously let an event get
+      // permanently stuck at WAITING_FOR_Z2 with no plane ever appearing if
+      // LIVE happened to be off at the moment Z1 first fired).
+      if (liveEnabledRef.current) {
+        // 1) Z3 — highest priority. Preempts everything, from ANY state,
+        // the instant it fires — no confirm-window, no precondition on how
+        // far the event has gotten (not even entryAnimationCompleted).
+        if (z3Rising) {
+          for (const event of activeAircraftEventsRef.current.get(taxiwayId) ?? []) {
+            if (event.state !== 'TAKING_OFF' && !event.takeoffAnimationStarted) {
+              event.state = 'TAKING_OFF';
+              event.takeoffAnimationStarted = true;
+              transitioned = true;
+              emitSpawn(taxiwayId, 'TAKEOFF', event.id);
+            }
+          }
+        }
+
+        // 2) Z2 — only ever affects the event still WAITING_FOR_Z2 (the
+        // SAME plane Z1 created). A repeat Z2 hit afterward, or one with no
+        // such event, is a pure no-op.
+        if (z2Rising) {
+          const event = (activeAircraftEventsRef.current.get(taxiwayId) ?? [])
+            .find((e) => e.state === 'WAITING_FOR_Z2');
+          if (event && !event.enteringAnimationStarted) {
+            event.state = 'ENTERING_RUNWAY_HEAD';
+            event.enteringAnimationStarted = true;
+            transitioned = true;
+            emitSpawn(taxiwayId, 'RUNWAY_HOLDING', event.id);
+          }
+        }
+
+        // 3) Z1 — only ever creates a brand-new event; never touches an
+        // existing one. Blocked while this taxiway has any tracked event
+        // that HASN'T (yet) reached TAKING_OFF — checked AFTER Z3 above has
+        // already run this same pass, so a same-pass "Z3 confirms the
+        // existing plane is now departing AND Z1 detects a new one" combo is
+        // honored as two different planes (跑道上有人正在起飛，但同時偵測到
+        // 另一架新的進入聯絡道) rather than blocked just because the
+        // departing one's entry hasn't been removed from tracking yet (that
+        // only happens once its takeoff animation actually finishes — see
+        // the 'sim:aircraft-departed' listener). Z2/Z3 can never create a
+        // plane on their own (no event to act on when this branch hasn't
+        // run yet).
+        let justCreated: AircraftEvent | undefined;
+        if (z1Rising) {
+          const existingEvents = activeAircraftEventsRef.current.get(taxiwayId) ?? [];
+          const blocked = existingEvents.some((e) => e.state !== 'TAKING_OFF');
+          if (!blocked) {
+            justCreated = {
+              id: `evt-${++eventIdCounter}`,
+              state: 'WAITING_FOR_Z2',
+              entryAnimationCompleted: false,
+              enteringAnimationStarted: false,
+              takeoffAnimationStarted: false,
+            };
+            activeAircraftEventsRef.current.set(taxiwayId, [...existingEvents, justCreated]);
+            transitioned = true;
+            emitSpawn(taxiwayId, 'ENTERING', justCreated.id);
+          }
+        }
+
+        // If Z1 just created a brand-new event THIS SAME pass, a same-pass
+        // Z2/Z3 rising edge still needs to apply to it — the Z2/Z3 checks
+        // above ran BEFORE this event existed, so they had nothing to act
+        // on and became no-ops. Without this, zones that sit physically
+        // close together (all crossed in the same real-time sample) would
+        // permanently strand the event at WAITING_FOR_Z2: rising-edge
+        // detection means Z2/Z3 won't fire again once already `true`, so a
+        // signal that stays continuously true from here on would never
+        // give the event a second chance to advance. Still respects Z3 >
+        // Z2 priority for this same new event.
+        if (justCreated) {
+          if (z3Rising) {
+            justCreated.state = 'TAKING_OFF';
+            justCreated.takeoffAnimationStarted = true;
+            transitioned = true;
+            emitSpawn(taxiwayId, 'TAKEOFF', justCreated.id);
+          } else if (z2Rising) {
+            justCreated.state = 'ENTERING_RUNWAY_HEAD';
+            justCreated.enteringAnimationStarted = true;
+            transitioned = true;
+            emitSpawn(taxiwayId, 'RUNWAY_HOLDING', justCreated.id);
+          }
+        }
+      }
+
+      const events = activeAircraftEventsRef.current.get(taxiwayId) ?? [];
+
+      // 只要有進行中的事件（尚未起飛），就持續延長告警 — intentionally
+      // decoupled from the state transitions above: only ever reads the
+      // (already-updated) event list, never gates or affects it.
+      // armRunwayAlert already self-gates on LIVE, so no double-check
+      // needed here. mayCreate=false — this may never START a fresh alert
+      // on its own; only 跑道入侵線 (reportIncursionLineTrigger) may.
+      if (events.some((e) => e.state !== 'TAKING_OFF')) {
+        armRunwayAlert(false);
+      }
+
+      // Up to two events may be tracked — show whichever is furthest along.
+      const rank = (s: AircraftEventState) => s === 'TAKING_OFF' ? 4
+        : s === 'HOLDING_AT_RUNWAY_HEAD' ? 3
+        : s === 'ENTERING_RUNWAY_HEAD' ? 2
+        : 1; // WAITING_FOR_Z2
+      const furthest = events.reduce<AircraftEvent | null>(
+        (best, e) => (!best || rank(e.state) > rank(best.state) ? e : best), null
+      );
+      results.set(taxiwayId, {
+        transitioned,
+        currentAnimation: furthest
+          ? AIRCRAFT_STATE_LABELS[furthest.state]
+          : (liveEnabledRef.current ? 'NO_ACTIVE_EVENT' : 'LIVE_OFF'),
+      });
+    }
+    return results;
+  }, [emitSpawn, armRunwayAlert]);
+
+  // ── Local-first publish to aiDetectionStateStore ───────────────────────
+  // Called once per taxiway, every AI 判讀 pass, immediately after
+  // processAircraftEventSnapshot — this is the "發布Snapshot到前端共享Store"
+  // step of the operator's Local-first + Server Reconciliation spec.
+  // LiveMonitor (and any other subscriber) sees this the instant it's
+  // called, no network round trip. incursionLatched is a LOCAL prediction
+  // mirroring SimulationEngine.processDetection's own authorization check
+  // (any real signal this pass + taxiway not currently AUTHORIZED per the
+  // client's own already-synced systemState) — the server's later
+  // 'taxiway:state-updated' broadcast is what actually confirms/corrects it
+  // (see reconcileFromServerTaxiwayState in useSocket.ts).
+  const publishAiDetectionSnapshot = useCallback((
+    taxiwayId: string,
+    judgment: { z1Motion: boolean; z2Motion: boolean; z3Triggered: boolean; confidence: number },
+    events: AircraftEvent[],
+    incursionLineHit: boolean,
+    analyzedAt: number,
+    canIssueIncursionAlert: boolean,
+  ) => {
+    const furthest = events.reduce<AircraftEvent | null>((best, e) => {
+      const rank = (s: AircraftEventState) => s === 'TAKING_OFF' ? 4 : s === 'HOLDING_AT_RUNWAY_HEAD' ? 3 : s === 'ENTERING_RUNWAY_HEAD' ? 2 : 1;
+      return !best || rank(e.state) > rank(best.state) ? e : best;
+    }, null);
+
+    // The Gate (canIssueIncursionAlert) ONLY controls whether a real
+    // incursion-line hit is ever CLASSIFIED as an alert-worthy INCURSION —
+    // it never touches the Z1/Z2/Z3-driven branches below, so aircraft-
+    // event/animation status (AIRCRAFT_DETECTED/ENTERING_RUNWAY/TAKEOFF)
+    // keeps updating normally off raw AI 判讀 even while the Gate is closed.
+    let eventType: AiDetectionEventType = 'NONE';
+    if (incursionLineHit && canIssueIncursionAlert) eventType = 'INCURSION';
+    else if (furthest?.state === 'TAKING_OFF') eventType = 'TAKEOFF';
+    else if (furthest?.state === 'ENTERING_RUNWAY_HEAD' || furthest?.state === 'HOLDING_AT_RUNWAY_HEAD') eventType = 'ENTERING_RUNWAY';
+    else if (furthest) eventType = 'AIRCRAFT_DETECTED';
+
+    const authState = appState.systemState?.taxiways.find((t) => t.id === taxiwayId)?.state;
+    // Only a real, Gate-approved INCURSION classification on an unauthorized
+    // taxiway may ever latch locally — NOT merely "some aircraft event
+    // exists here" (that was a pre-existing bug: any Z1-created event on an
+    // unauthorized taxiway read as incursionLatched immediately, long before
+    // anything actually crossed the incursion line).
+    const incursionLatched = eventType === 'INCURSION' && authState !== 'AUTHORIZED';
+
+    if (eventType === 'NONE') {
+      aiSnapshotEventIdRef.current.delete(taxiwayId);
+    } else if (!aiSnapshotEventIdRef.current.has(taxiwayId)) {
+      // Reuse the tracked AircraftEvent's own id when one exists (naturally
+      // correlates the ground-sim event and this snapshot for the same
+      // plane); otherwise (incursion-line-only, no Z1/Z2/Z3 event) mint a
+      // dedicated local id. Held stable for as long as this taxiway's
+      // eventType stays active — cleared above once it returns to NONE. This
+      // is the "aircraftEventId" segment of alertEventId below.
+      aiSnapshotEventIdRef.current.set(taxiwayId, furthest?.id ?? `local-incursion-${taxiwayId}-${analyzedAt}`);
+    }
+    const aircraftEventId = aiSnapshotEventIdRef.current.get(taxiwayId) ?? `local-none-${taxiwayId}`;
+
+    // alertEventId = generationId + aircraftEventId + taxiwayId + alertType
+    // (see buildAlertEventId) — the ONE id shared end-to-end by this alert
+    // instance, only ever constructed when this pass is genuinely INCURSION.
+    // Stable for as long as aircraftEventId/generationId don't change, so
+    // re-publishing the same ongoing incident (or the Gate flapping open/
+    // closed/open while the underlying condition never actually cleared)
+    // always reproduces the SAME string — which is exactly what lets
+    // aiDetectionStateStore's shownAlertIds/dismissedAlertIds dedup work.
+    // The other eventTypes aren't alerts, so they just reuse aircraftEventId
+    // directly — no alert-identity scheme needed for plain status.
+    const eventId = eventType === 'INCURSION'
+      ? buildAlertEventId(getCurrentGenerationId(), aircraftEventId, taxiwayId, 'RUNWAY_INCURSION')
+      : aircraftEventId;
+
+    const sequence = (aiSnapshotSequenceRef.current.get(taxiwayId) ?? -1) + 1;
+    aiSnapshotSequenceRef.current.set(taxiwayId, sequence);
+
+    const zoneSnapshot = (motion: boolean, confidence: number) => ({ motion, triggered: motion, confidence });
+    const snapshot: AiDetectionSnapshot = {
+      eventId,
+      taxiwayId: taxiwayId as TaxiwayId,
+      sequence,
+      generationId: getCurrentGenerationId(),
+      analyzedAt,
+      videoTime: videoRef.current?.currentTime ?? 0,
+      source: 'LOCAL_AI',
+      status: 'PENDING_SERVER',
+      zones: {
+        Z1: zoneSnapshot(judgment.z1Motion, judgment.z1Motion ? judgment.confidence : 0),
+        Z2: zoneSnapshot(judgment.z2Motion, judgment.z2Motion ? judgment.confidence : 0),
+        Z3: zoneSnapshot(judgment.z3Triggered, judgment.z3Triggered ? judgment.confidence : 0),
+      },
+      decision: { eventType, incursionLatched },
+    };
+
+    applyRunwayStateUpdate(snapshot);
+    broadcastSnapshot(snapshot);
+    return snapshot;
+  }, [appState.systemState]);
+
+  // ── AI 判讀 pass ─────────────────────────────────────────────────────────
+  // Once per AI_DETECTION_INTERVAL_MS (1s): sample every zone, build ONE
+  // AircraftEventSnapshot, use it to update the "偵測區域設定" display, then
+  // hand that EXACT SAME snapshot to processAircraftEventSnapshot — the two
+  // can never show/use different data because there is only one snapshot
+  // object and no separately recomputed reading anywhere. Guarded against
+  // overlap (analysisInProgressRef) and staleness (analysisRequestIdRef) —
+  // today's implementation is fully synchronous so neither can actually
+  // trigger mid-pass, but both are real safety nets: overlap-guard for if
+  // this ever becomes genuinely async, staleness-guard for a seek arriving
+  // and superseding whatever pass was current.
   const runDetectionTick = useCallback(() => {
+      if (analysisInProgressRef.current) return; // previous pass still "running" — skip, don't overlap
       const video = videoRef.current;
       if (!video || video.readyState < 2) return;
       const zones = motionZonesRef.current;
@@ -915,163 +1381,188 @@ export function ZoneConfigPage() {
         return; // nothing configured to scan
       }
 
-      let maxScore = 0;
-      // Zones that hit threshold THIS tick — keyed by object identity (a
-      // Set), not zone.id, since two different taxiways can each have their
-      // own zone reusing the label 'Z1'/'Z2'/'Z3'.
-      const hitZones = new Set<DetectorMotionZone>();
-      // Raw score per zone this tick — feeds both the debug panel and the
-      // live ZoneScoreBadge readouts below.
-      const scoreByZone = new Map<DetectorMotionZone, number>();
-      for (const zone of zones) {
-        const score = computeZoneScore(video, zone);
-        scoreByZone.set(zone, score);
-        if (score > maxScore) maxScore = score;
-        // Per-zone threshold override (zone.threshold) falls back to the
-        // shared default — see DetectorMotionZone's comment.
-        if (score >= (zone.threshold ?? motionThresholdRef.current)) {
-          // Real-time safety reporting (runway alert + backend incursion
-          // pipeline) — deliberately immediate, per-zone, NOT gated behind
-          // the event-confirmation logic below. That confirmation exists to
-          // stop the ground-sim animation/status text from reacting to a
-          // single noisy frame; it must not also delay the actual alert.
-          // mayCreate is true only for Z1 — "TRIGGER自動警戒一定要Z1觸發，
-          // 只有告警觸發後Z2/Z3延長": Z2/Z3 (and any zone beyond Z3) may only
-          // extend an alert Z1 already started, never begin a fresh one on
-          // their own. Non-Z1/Z2/Z3 zones (a plain detection region with no
-          // special taxi-sequence meaning) default to extend-only too, same
-          // reasoning as Z2/Z3.
-          const mayCreate = zone.id === 'Z1';
-          armRunwayAlert(mayCreate);
-          reportPlaneDetected('DETECTOR-VIDEO-MOTION', Math.min(0.95, 0.5 + score * 10), zone.taxiway_id, zone.id, undefined, mayCreate);
-          hitZones.add(zone);
-        }
-      }
-
-      // ── 事件判定：Z1/Z2/Z3 整合為同一架飛機的完整事件狀態機 ────────────────
-      // Collect this tick's COMPLETE zone snapshot per taxiway first — never
-      // act on a single zone's hit in isolation. Z1/Z2/Z3 are matched by
-      // object identity within that taxiway's own zone list, not a bare id
-      // lookup, for the same multi-taxiway reason as hitZones above.
-      const zonesByTaxiway = new Map<string, DetectorMotionZone[]>();
-      for (const zone of zones) {
-        const list = zonesByTaxiway.get(zone.taxiway_id) ?? [];
-        list.push(zone);
-        zonesByTaxiway.set(zone.taxiway_id, list);
-      }
-
-      // "AI 判讀現況" reuses the exact same event state this loop just
-      // updated — one source of truth, instead of two separately-derived
-      // readings that can disagree. If more than one taxiway has an active
-      // event this tick, shows whichever is furthest along.
-      let bestLabel: string | null = null;
-      let bestTaxiway: string | null = null;
-      let bestRank = -1;
-      const nextDebug: Record<string, RunwayDebugSnapshot> = {};
-
-      for (const [taxiwayId, taxiwayZones] of zonesByTaxiway) {
-        const z1zone = taxiwayZones.find((z) => z.id === 'Z1');
-        const z2zone = taxiwayZones.find((z) => z.id === 'Z2');
-        const z3zone = taxiwayZones.find((z) => z.id === 'Z3');
-        const z1 = !!z1zone && hitZones.has(z1zone);
-        const z2 = !!z2zone && hitZones.has(z2zone);
-        const z3 = !!z3zone && hitZones.has(z3zone);
-
-        // Z1 creates a NEW event if either (a) no event exists yet for this
-        // taxiway, or (b) every existing event has already reached
-        // HOLDING_AT_RUNWAY_HEAD/TAKING_OFF — physically clear of Z1's zone,
-        // since a plane can't be at Z1 and at/near the runway head at the
-        // same time (operator request: "支援兩台，Z1直接開第二個就好" — see
-        // AircraftEventState's concurrency-cap comment). Z1 later dropping
-        // back to false never clears anything — nothing here ever deletes an
-        // existing entry; only 'sim:aircraft-departed' (takeoff animation
-        // finished) or resetTemporalDetectionState (seek/RESET/demo reset)
-        // do. Starts directly in ENTERING_RUNWAY_HEAD with
-        // entryAnimationPlayed=true — operator request ("Z1/Z2 停一秒直接
-        // 進"): stage 1->2 no longer waits for real Z2 evidence, only
-        // AirportSimPanel's own bounded 1-second pause (see that file's
-        // TAXI_OUT case), so there's no separate "waiting for Z2" state to
-        // model here anymore. Real Z2 hits still matter below — they extend
-        // the alert and accelerate an already-playing animation — they just
-        // no longer gate whether stage 2 starts at all. Takeoff (Z3) is
-        // unaffected by any of this — still strictly evidence-gated, see
-        // evaluateTakeoff.
-        const existingEvents = activeAircraftEventsRef.current.get(taxiwayId) ?? [];
-        const hasInTransitEvent = existingEvents.some((e) => e.state !== 'HOLDING_AT_RUNWAY_HEAD' && e.state !== 'TAKING_OFF');
-        if (z1 && !hasInTransitEvent) {
-          activeAircraftEventsRef.current.set(taxiwayId, [
-            ...existingEvents,
-            {
-              state: 'ENTERING_RUNWAY_HEAD',
-              entryAnimationPlayed: true,
-              entryAnimationCompleted: false,
-              z3MotionFrameCount: 0,
-              z3MotionConfirmed: false,
-              takeoffAnimationPlayed: false,
-            },
-          ]);
-          emitSpawn(taxiwayId, 'ENTERING');
+      analysisInProgressRef.current = true;
+      const requestId = ++analysisRequestIdRef.current;
+      try {
+        // Computed ONCE per pass so every taxiway/zone this tick sees the
+        // exact same Gate reading — see computeCanIssueIncursionAlert's
+        // comment. Only ever gates whether an incursion-line hit may be
+        // CLASSIFIED as an alert (and, downstream, actually reported to the
+        // backend) — never the Z1/Z2/Z3 event/animation machine below.
+        const gateState = getAlertGateState();
+        const gateOpen = computeCanIssueIncursionAlert(gateState);
+        let maxScore = 0;
+        // Zones that hit threshold THIS pass — keyed by object identity (a
+        // Set), not zone.id, since two different taxiways can each have
+        // their own zone reusing the label 'Z1'/'Z2'/'Z3'.
+        const hitZones = new Set<DetectorMotionZone>();
+        // Raw score per zone this pass — feeds both the debug panel and the
+        // live ZoneScoreBadge readouts below.
+        const scoreByZone = new Map<DetectorMotionZone, number>();
+        for (const zone of zones) {
+          const score = computeZoneScore(video, zone);
+          scoreByZone.set(zone, score);
+          if (score > maxScore) maxScore = score;
+          // Per-zone threshold override (zone.threshold) falls back to the
+          // shared default — see DetectorMotionZone's comment.
+          if (score >= (zone.threshold ?? motionThresholdRef.current)) {
+            // Z1/Z2/Z3 are taxiway-tracking zones for the ground-sim event
+            // machine, NOT the safety-incursion trigger — they only ever
+            // touch the 跑道警戒 (runway alert) countdown, never the actual
+            // incursion-detection pipeline (demoApi.detect, via
+            // reportPlaneDetected). Only the 跑道入侵線 (see
+            // reportIncursionLineTrigger below) may ever report a real
+            // detection that can latch INCURSION. Within the countdown
+            // itself: only Z1 may START a fresh window (mayCreate=true);
+            // Z2/Z3 may only EXTEND one that's already running — a plane
+            // visibly still taxiing keeps the window alive, but entering Z2/
+            // Z3 alone (without Z1 or the incursion line ever having armed
+            // anything) must not start one from nothing.
+            armRunwayAlert(zone.id === 'Z1');
+            hitZones.add(zone);
+          }
         }
 
-        const events = activeAircraftEventsRef.current.get(taxiwayId) ?? [];
+        // ── 組成本次 AI 判讀的統一 Snapshot ────────────────────────────────
+        const zonesByTaxiway = new Map<string, DetectorMotionZone[]>();
+        for (const zone of zones) {
+          const list = zonesByTaxiway.get(zone.taxiway_id) ?? [];
+          list.push(zone);
+          zonesByTaxiway.set(zone.taxiway_id, list);
+        }
+        const zoneInfoByTaxiway = new Map<string, { z1zone?: DetectorMotionZone; z2zone?: DetectorMotionZone; z3zone?: DetectorMotionZone }>();
+        const snapshot: AircraftEventSnapshot = {
+          analysisRequestId: requestId,
+          analysisTimestamp: Date.now(),
+          taxiways: new Map(),
+        };
+        for (const [taxiwayId, taxiwayZones] of zonesByTaxiway) {
+          const z1zone = taxiwayZones.find((z) => z.id === 'Z1');
+          const z2zone = taxiwayZones.find((z) => z.id === 'Z2');
+          const z3zone = taxiwayZones.find((z) => z.id === 'Z3');
+          zoneInfoByTaxiway.set(taxiwayId, { z1zone, z2zone, z3zone });
+          snapshot.taxiways.set(taxiwayId, {
+            z1Motion: !!z1zone && hitZones.has(z1zone),
+            z2Motion: !!z2zone && hitZones.has(z2zone),
+            z3Triggered: !!z3zone && hitZones.has(z3zone),
+            confidence: z3zone ? (scoreByZone.get(z3zone) ?? 0) : (z1zone ? scoreByZone.get(z1zone) ?? 0 : 0),
+          });
+        }
 
-        if (events.length > 0) {
-          // Real Z2 evidence, whenever it does arrive, still accelerates an
-          // already-playing stage-1/stage-2 animation (AirportSimPanel's
-          // RUNWAY_HOLDING handler sets headPending/catchUp on whichever
-          // tracked vehicle is still in transit) — idempotent, safe to emit
-          // every tick Z2 is hit, same as ENTERING's repeat pings. No longer
-          // gates anything on this side; it just no longer creates a second
-          // event either (only Z1 ever does, above).
-          if (z2) {
-            emitSpawn(taxiwayId, 'RUNWAY_HOLDING');
+        // 這次判讀若已被更新的（例如 seek 觸發的）請求取代，放棄套用結果——
+        // 舊的非同步判讀結果不得覆蓋新結果。
+        if (requestId !== analysisRequestIdRef.current) return;
+
+        // ── 跑道入侵線 ── scored here (once — computeZoneScore mutates its
+        // baseline, so it must never be sampled twice in one pass) so both
+        // the trigger below AND the per-taxiway publish loop further down
+        // can use the same result. Never feeds the ground-sim projection
+        // (that's Z1/Z2/Z3's job); this is a real safety trigger, so it
+        // always grabs a snapshot of the actual frame instead. Backend
+        // already checks the taxiway's real authorization state and only
+        // latches INCURSION_LATCHED if it wasn't authorized — no separate
+        // check needed here, crossing the line just reports "something
+        // crossed" the same way any zone does. Goes through its own direct
+        // reportIncursionLineTrigger, not the shared reportPlaneDetected —
+        // operator request: immediate, undelayed, with its own 30s debounce
+        // (INCURSION_LINE_TRIGGER_COOLDOWN_MS) independent of Z1/Z2/Z3's.
+        // The actual reportIncursionLineTrigger call is deferred to the
+        // per-taxiway loop below (after processAircraftEventSnapshot), so it
+        // can use that taxiway's freshly-published alertEventId (published.
+        // eventId) instead of re-deriving one here — one composition point,
+        // not two.
+        let incursionLineHit = false;
+        let incursionLineConfidence = 0;
+        let incursionLineSnapshotBase64: string | undefined;
+        if (incursionLine) {
+          const score = computeZoneScore(video, incursionLine);
+          scoreByZone.set(incursionLine, score);
+          if (score > maxScore) maxScore = score;
+          if (score >= (incursionLine.threshold ?? motionThresholdRef.current)) {
+            incursionLineHit = true;
+            incursionLineConfidence = Math.min(0.95, 0.5 + score * 10);
+            incursionLineSnapshotBase64 = captureSnapshot(video);
+          }
+        }
+
+        // ── 交給唯一的事件狀態機判定 ────────────────────────────────────────
+        const results = processAircraftEventSnapshot(snapshot);
+
+        // ── 用同一份 snapshot + 狀態機處理結果組出 debug 面板，兩邊資料完全
+        // 同源，不會有「畫面顯示 false 但動畫卻自己觸發」的分歧。同一個迴圈裡
+        // 也立即 publishAiDetectionSnapshot——LiveMonitor 用的資料跟這裡顯示
+        // 的 AI 判讀現況是同一份，不是分開算兩次 ──────────────────────────
+        let bestLabel: string | null = null;
+        let bestTaxiway: string | null = null;
+        let bestRank = -1;
+        const nextDebug: Record<string, RunwayDebugSnapshot> = {};
+        for (const [taxiwayId, judgment] of snapshot.taxiways) {
+          const { z3zone } = zoneInfoByTaxiway.get(taxiwayId)!;
+          const result = results.get(taxiwayId)!;
+          const events = activeAircraftEventsRef.current.get(taxiwayId) ?? [];
+          const taxiwayIncursionLineHit = incursionLineHit && incursionLine?.taxiway_id === taxiwayId;
+          const published = publishAiDetectionSnapshot(taxiwayId, judgment, events, taxiwayIncursionLineHit, snapshot.analysisTimestamp, gateOpen);
+          // Only actually report to the backend when publishAiDetectionSnapshot
+          // itself classified this pass as a real, Gate-approved INCURSION —
+          // that classification is the single source of truth (mirrors
+          // exactly what the local popup/sound dedup keys off), so this can
+          // never fire when the Gate was closed even if the raw line hit is
+          // true. published.eventId IS the alertEventId in that case (see
+          // publishAiDetectionSnapshot's comment).
+          if (taxiwayIncursionLineHit && published.decision.eventType === 'INCURSION') {
+            reportIncursionLineTrigger(incursionLineConfidence, taxiwayId, incursionLineSnapshotBase64, published.eventId);
           }
 
-          // 只要有進行中的事件（尚未起飛），就持續延長告警 — not just whenever
-          // Z1/Z2's own raw score happens to still be above threshold THIS
-          // tick (the earlier per-zone loop's job). The plane physically
-          // leaves each zone's box well before the animation (or the wait at
-          // the runway head) finishes, so relying on a zone staying hit
-          // would let the alert window quietly expire mid-animation. Any
-          // active, not-yet-departed event is itself real, still-valid
-          // evidence a plane is in transit. mayCreate=false (extend only) —
-          // this may never START a fresh alert on its own, per "TRIGGER自動
-          // 警戒一定要Z1觸發，只有告警觸發後Z2/Z3延長".
-          if (events.some((e) => e.state !== 'TAKING_OFF')) {
-            armRunwayAlert(false);
-          }
+          // ── Gate/dedup debug — read directly off the SAME decision this
+          // pass already made (published.decision, gateState), never a
+          // separately re-derived approximation, so this panel can never
+          // show a reason that disagrees with what actually happened above.
+          const isAlertPass = published.decision.eventType === 'INCURSION';
+          const alertEventId = isAlertPass ? published.eventId : null;
+          const alertAlreadyShown = alertEventId !== null && isAlertShown(taxiwayId as TaxiwayId, alertEventId);
+          const alertSoundAlreadyPlayed = alertEventId !== null && hasPlayedAlert(alertEventId);
+          const alertDismissed = alertEventId !== null && isAlertDismissed(taxiwayId as TaxiwayId, alertEventId);
+          const serverIncursionLatched = appState.systemState?.taxiways.find((t) => t.id === taxiwayId)?.state === 'INCURSION_LATCHED';
+          const noAlertReason = !taxiwayIncursionLineHit ? 'NO_INCURSION_LINE_HIT'
+            : gateState.systemStatus !== 'RUNNING' ? `SYSTEM_NOT_RUNNING(${gateState.systemStatus})`
+            : !gateState.monitoringEnabled ? 'MONITORING_DISABLED_OR_VIDEO_NOT_PLAYING'
+            : gateState.runwayAlertState !== 'ARMED' ? 'RUNWAY_NOT_ARMED'
+            : alertDismissed ? 'DISMISSED_SUPPRESSED'
+            : alertAlreadyShown ? 'ALREADY_SHOWN_DEDUP'
+            : 'ALERT_ISSUED';
 
-          for (const event of events) {
-            // Z3 motion confirmation — only accumulated once THIS event's
-            // plane has ACTUALLY, physically arrived at the runway head
-            // (entryAnimationCompleted, reported by AirportSimPanel — real
-            // animation-timing evidence, not just this side's own state,
-            // which can now reach ENTERING_RUNWAY_HEAD almost immediately
-            // after Z1 thanks to the bounded pause above). Gating on
-            // entryAnimationCompleted specifically (rather than state) keeps
-            // Z3 from ever pre-accumulating confirm-ticks before the plane
-            // is genuinely there — a hit before that point means the zones
-            // overlap or are miscalibrated, not that the plane is genuinely
-            // near takeoff, and letting it pre-accumulate is what caused
-            // "Z3/Z2 被同時觸發是起飛" (instant takeoff, no visible pause at
-            // the runway head) before this gate existed. With up to two
-            // events active, this naturally only ever matters for whichever
-            // one has already arrived — a second, still-in-transit event's
-            // count simply stays at 0.
-            if (event.entryAnimationCompleted && event.state !== 'TAKING_OFF') {
-              event.z3MotionFrameCount = z3 ? event.z3MotionFrameCount + 1 : 0;
-              if (event.z3MotionFrameCount >= Z3_MOTION_CONFIRM_FRAMES) event.z3MotionConfirmed = true;
-            }
-          }
-
-          evaluateTakeoff(taxiwayId);
-
-          // "AI 判讀現況" shows whichever of this taxiway's (up to two)
-          // events is furthest along.
+          nextDebug[taxiwayId] = {
+            analysisTimestamp: snapshot.analysisTimestamp,
+            motionScore: z3zone ? (scoreByZone.get(z3zone) ?? 0) : 0,
+            motionThreshold: z3zone?.threshold ?? motionThresholdRef.current,
+            z1Motion: judgment.z1Motion,
+            z2Motion: judgment.z2Motion,
+            z3Triggered: judgment.z3Triggered,
+            transitioned: result.transitioned,
+            currentAnimation: result.currentAnimation,
+            systemStatus: gateState.systemStatus,
+            monitoringEnabled: gateState.monitoringEnabled,
+            runwayAlertState: gateState.runwayAlertState,
+            canIssueIncursionAlert: gateOpen,
+            aircraftEventId: aiSnapshotEventIdRef.current.get(taxiwayId) ?? null,
+            alertEventId,
+            alertAlreadyShown,
+            alertSoundAlreadyPlayed,
+            alertDismissed,
+            serverIncursionLatched,
+            noAlertReason,
+            events: events.map((event) => ({
+              state: event.state,
+              entryAnimationCompleted: event.entryAnimationCompleted,
+              eventReason: AIRCRAFT_STATE_LABELS[event.state],
+            })),
+            aiSnapshot: published,
+          };
           for (const event of events) {
             const rank = event.state === 'TAKING_OFF' ? 4
               : event.state === 'HOLDING_AT_RUNWAY_HEAD' ? 3
-              : 2; // ENTERING_RUNWAY_HEAD — the only remaining state
+              : event.state === 'ENTERING_RUNWAY_HEAD' ? 2
+              : 1; // WAITING_FOR_Z2
             if (rank > bestRank) {
               bestRank = rank;
               bestLabel = AIRCRAFT_STATE_LABELS[event.state];
@@ -1079,61 +1570,22 @@ export function ZoneConfigPage() {
             }
           }
         }
-
-        nextDebug[taxiwayId] = {
-          motionScore: z3zone ? (scoreByZone.get(z3zone) ?? 0) : 0,
-          motionThreshold: z3zone?.threshold ?? motionThresholdRef.current,
-          z1, z2, z3,
-          events: events.map((event) => ({
-            state: event.state,
-            entryAnimationCompleted: event.entryAnimationCompleted,
-            z3MotionFrameCount: event.z3MotionFrameCount,
-            z3MotionConfirmed: event.z3MotionConfirmed,
-            takeoffAnimationPlayed: event.takeoffAnimationPlayed,
-            eventReason: event.state === 'ENTERING_RUNWAY_HEAD'
-              ? `ENTERING_ANIMATION_PLAYING (entryAnimationCompleted=${String(event.entryAnimationCompleted)}, Z3 motion ${event.z3MotionFrameCount}/${Z3_MOTION_CONFIRM_FRAMES}${event.z3MotionConfirmed ? '，已提前確認，等進入動畫播完才起飛' : ''})`
-              : event.state === 'HOLDING_AT_RUNWAY_HEAD'
-                ? `HOLDING_AT_RUNWAY_HEAD (Z3 motion ${event.z3MotionFrameCount}/${Z3_MOTION_CONFIRM_FRAMES})`
-                : 'TAKEOFF_ANIMATION_PLAYING',
-          })),
-        };
-      }
-      setRunwayDebug(nextDebug);
-      if (bestLabel && bestTaxiway) {
-        setCurrentStatus({ label: bestLabel, taxiwayId: bestTaxiway, at: Date.now() });
-      }
-
-      // 跑道入侵線 — same scoring, but never feeds the ground-sim projection
-      // (that's Z1/Z2/Z3's job); this is a real safety trigger, so it always
-      // grabs a snapshot of the actual frame instead. Backend already checks
-      // the taxiway's real authorization state and only latches
-      // INCURSION_LATCHED if it wasn't authorized — no separate check needed
-      // here, crossing the line just reports "something crossed" the same
-      // way any zone does.
-      if (incursionLine) {
-        const score = computeZoneScore(video, incursionLine);
-        scoreByZone.set(incursionLine, score);
-        if (score > maxScore) maxScore = score;
-        if (score >= (incursionLine.threshold ?? motionThresholdRef.current)) {
-          armRunwayAlert();
-          reportPlaneDetected(
-            'DETECTOR-INCURSION-LINE',
-            Math.min(0.95, 0.5 + score * 10),
-            incursionLine.taxiway_id,
-            incursionLine.id,
-            captureSnapshot(video),
-          );
+        setRunwayDebug(nextDebug);
+        if (bestLabel && bestTaxiway) {
+          setCurrentStatus({ label: bestLabel, taxiwayId: bestTaxiway, at: Date.now() });
         }
+
+        // Live per-zone score readout for ZoneScoreBadge — same measurement
+        // just taken above for real judgment, keyed by zone.id for the UI.
+        const nextZoneScores: Record<string, number> = {};
+        for (const [zone, score] of scoreByZone) nextZoneScores[zone.id] = score;
+        setZoneScores(nextZoneScores);
+
+        setMotionLevel(maxScore);
+      } finally {
+        analysisInProgressRef.current = false;
       }
-
-      // Live per-zone score readout for ZoneScoreBadge — same measurement
-      // just taken above for real judgment, keyed by zone.id for the UI.
-      const nextZoneScores: Record<string, number> = {};
-      for (const [zone, score] of scoreByZone) nextZoneScores[zone.id] = score;
-      setZoneScores(nextZoneScores);
-
-      setMotionLevel(maxScore);
-  }, [computeZoneScore, captureSnapshot, reportPlaneDetected, armRunwayAlert]);
+  }, [computeZoneScore, captureSnapshot, reportIncursionLineTrigger, armRunwayAlert, processAircraftEventSnapshot, publishAiDetectionSnapshot, getAlertGateState]);
 
   useEffect(() => {
     if (!motionEnabled) {
@@ -1141,41 +1593,42 @@ export function ZoneConfigPage() {
       prevFramesRef.current = new Map(); // avoid a stale-diff false trigger on re-enable
       return;
     }
-    const intervalId = setInterval(runDetectionTick, DETECT_INTERVAL_MS);
-    return () => clearInterval(intervalId);
+    // Self-rescheduling setTimeout, not a fixed setInterval — lets the
+    // actual real-time gap between passes scale down with video playback
+    // rate (same pattern as RUNWAY_ALERT_DURATION_MS/TRIGGER_COOLDOWN_MS),
+    // recomputed fresh via playbackRateRef.current on every reschedule
+    // rather than needing to tear down/rebuild the timer on a rate change.
+    // AI_DETECTION_INTERVAL_MS stays the base rate at 1x — this doesn't
+    // change the "once per second" cadence the operator asked for at normal
+    // speed, only how it scales when the video is sped up.
+    let timeoutId: ReturnType<typeof setTimeout>;
+    let cancelled = false;
+    const schedule = () => {
+      const delayMs = AI_DETECTION_INTERVAL_MS / playbackRateRef.current;
+      timeoutId = setTimeout(() => {
+        if (cancelled) return;
+        runDetectionTick();
+        schedule();
+      }, delayMs);
+    };
+    schedule();
+    return () => { cancelled = true; clearTimeout(timeoutId); };
   }, [motionEnabled, runDetectionTick]);
 
-  // Several closely-spaced extra runDetectionTick() calls right after a seek
-  // completes — rebuilds z3Triggered/event confirmation in well under a
-  // second instead of waiting out DETECT_INTERVAL_MS-paced ticks (up to
-  // ~2.5s worst case for a fresh TAKEOFF confirmation from a cold reset).
-  // Implemented by calling the SAME tick function the normal interval uses
-  // (not a separate/duplicated analysis path) — extra samples close together
-  // are harmless, so this can safely run alongside the normal interval
-  // rather than needing to pause/replace it.
-  const SEEK_BURST_TICKS = 5;
-  const SEEK_BURST_INTERVAL_MS = 120;
-  const runSeekBurst = useCallback((requestId: number) => {
-    let i = 0;
-    const step = () => {
-      if (seekRequestIdRef.current !== requestId) return; // superseded by a newer seek — abandon
-      runDetectionTick();
-      i += 1;
-      if (i < SEEK_BURST_TICKS) {
-        setTimeout(step, SEEK_BURST_INTERVAL_MS);
-      } else if (seekRequestIdRef.current === requestId) {
-        isSeekingRef.current = false;
-        setAnalysisStatus('IDLE');
-      }
-    };
-    setTimeout(step, SEEK_BURST_INTERVAL_MS);
-  }, [runDetectionTick]);
-
+  // 影片跳轉完成、新影格已經載入後，立即執行一次 AI 判讀，不必等下一個
+  // AI_DETECTION_INTERVAL_MS 週期——用的是同一個 runDetectionTick，不是另一
+  // 條獨立的重新分析路徑。handleVideoSeeking 已經清空 prevFramesRef，所以這
+  // 次判讀的每個區域都會先建立新的比對基準（computeZoneScore 的 cold-start
+  // 行為固定回傳 0），不會把 seek 前後影格的落差誤判成 motion。
   const handleVideoSeeked = useCallback(() => {
     const requestId = seekRequestIdRef.current;
     setSeekDebug({ seekRequestId: requestId, targetTime: videoRef.current?.currentTime ?? 0 });
-    runSeekBurst(requestId);
-  }, [runSeekBurst]);
+    runDetectionTick();
+    if (seekRequestIdRef.current === requestId) {
+      isSeekingRef.current = false;
+      setAnalysisStatus('IDLE');
+    }
+  }, [runDetectionTick]);
 
   // ── 3. Manual marks — fires when playback crosses a marked timestamp ────
   const firedThisLoopRef = useRef<Set<number>>(new Set());
@@ -1193,7 +1646,10 @@ export function ZoneConfigPage() {
     for (const trigger of config.video_trigger_seconds) {
       if (Math.abs(t - trigger) <= TRIGGER_TOLERANCE_S && !firedThisLoopRef.current.has(trigger)) {
         firedThisLoopRef.current.add(trigger);
-        reportPlaneDetected('DETECTOR-VIDEO-MANUAL', 0.95);
+        // Gate — a scripted replay trigger is still a real alert/backend-
+        // detection call, so it must pass the same Gate as every other
+        // source (see canIssueIncursionAlertNow's comment).
+        if (canIssueIncursionAlertNow()) reportPlaneDetected('DETECTOR-VIDEO-MANUAL', 0.95);
       }
     }
   };
@@ -1855,17 +2311,17 @@ export function ZoneConfigPage() {
                 {Object.entries(runwayDebug).map(([taxiwayId, d]) => (
                   <div key={taxiwayId} className="text-gray-500 space-y-0.5">
                     <div>
-                      {taxiwayId} · motion={(d.motionScore * 100).toFixed(1)}%/{(d.motionThreshold * 100).toFixed(0)}%
-                      {' '}· Z1={String(d.z1)} Z2={String(d.z2)} Z3={String(d.z3)} · {d.events.length} 台飛機
+                      {taxiwayId} · analysisTimestamp={new Date(d.analysisTimestamp).toLocaleTimeString('zh-TW', { hour12: false })}
+                      {' '}· motion={(d.motionScore * 100).toFixed(1)}%/{(d.motionThreshold * 100).toFixed(0)}%
+                    </div>
+                    <div>
+                      Z1.motion={String(d.z1Motion)} Z2.motion={String(d.z2Motion)} Z3.triggered={String(d.z3Triggered)}
+                      {' '}· transitioned={String(d.transitioned)} · currentAnimation={d.currentAnimation}
                     </div>
                     {d.events.map((e, i) => (
                       <div key={i} className="pl-2 border-l border-gray-800">
                         <div>
                           #{i + 1} state={e.state} · entryAnimationCompleted={String(e.entryAnimationCompleted)}
-                        </div>
-                        <div>
-                          z3MotionFrameCount={e.z3MotionFrameCount} · z3MotionConfirmed={String(e.z3MotionConfirmed)}
-                          {' '}· takeoffAnimationPlayed={String(e.takeoffAnimationPlayed)}
                         </div>
                         <div>{e.eventReason}</div>
                       </div>
@@ -1877,10 +2333,82 @@ export function ZoneConfigPage() {
               </div>
             </div>
 
+            {/* 告警 Gate + 去重 Debug */}
+            <div className="rounded border border-gray-800 bg-black/30 p-2.5">
+              <div className="text-xs font-medium text-gray-400 mb-1.5 flex items-center gap-1.5">
+                <Crosshair className="w-3.5 h-3.5" />
+                告警 Gate + 去重 Debug
+              </div>
+              <div className="font-mono text-[10px] text-gray-500 space-y-1.5">
+                {Object.entries(runwayDebug).map(([taxiwayId, d]) => (
+                  <div key={taxiwayId} className="text-gray-500 space-y-0.5 pb-1 border-b border-gray-900 last:border-0">
+                    <div>
+                      {taxiwayId} · systemStatus={d.systemStatus} · monitoringEnabled={String(d.monitoringEnabled)}
+                      {' '}· runwayAlertState={d.runwayAlertState}
+                      {' '}· canIssueIncursionAlert=
+                      <span style={{ color: d.canIssueIncursionAlert ? '#00ff88' : '#ff4444' }}>{String(d.canIssueIncursionAlert)}</span>
+                    </div>
+                    <div>
+                      aircraftEventId={d.aircraftEventId ?? '—'} · alertEventId={d.alertEventId ?? '—'}
+                    </div>
+                    <div>
+                      alertAlreadyShown={String(d.alertAlreadyShown)} · alertSoundAlreadyPlayed={String(d.alertSoundAlreadyPlayed)}
+                      {' '}· alertDismissed={String(d.alertDismissed)} · serverIncursionLatched={String(d.serverIncursionLatched)}
+                    </div>
+                    <div>
+                      noAlertReason=
+                      <span style={{ color: d.noAlertReason === 'ALERT_ISSUED' ? '#00ff88' : '#6b7280' }}>{d.noAlertReason}</span>
+                    </div>
+                  </div>
+                ))}
+                {Object.keys(runwayDebug).length === 0 && <div className="text-gray-600">尚無任何 taxiway 的判定資料</div>}
+              </div>
+            </div>
+
+            {/* Local-first + Server Reconciliation Debug */}
+            <div className="rounded border border-gray-800 bg-black/30 p-2.5">
+              <div className="text-xs font-medium text-gray-400 mb-1.5 flex items-center gap-1.5">
+                <Crosshair className="w-3.5 h-3.5" />
+                Local-first Debug（aiDetectionStateStore）
+              </div>
+              <div className="font-mono text-[10px] text-gray-500 space-y-1.5">
+                {Object.entries(runwayDebug).map(([taxiwayId, d]) => {
+                  const s = d.aiSnapshot;
+                  const timing = getTiming(taxiwayId as TaxiwayId);
+                  if (!s) return null;
+                  return (
+                    <div key={taxiwayId} className="text-gray-500 space-y-0.5 pb-1 border-b border-gray-900 last:border-0">
+                      <div>
+                        {taxiwayId} · eventId={s.eventId} · sequence={s.sequence} · generationId={s.generationId}
+                      </div>
+                      <div>
+                        source={s.source} · status={s.status} · eventType={s.decision.eventType} · incursionLatched={String(s.decision.incursionLatched)}
+                      </div>
+                      {timing && (
+                        <div>
+                          analyzedAt={new Date(timing.analyzedAt).toLocaleTimeString('zh-TW', { hour12: false })}
+                          {' '}· publishedAt=+{timing.publishedAt - timing.analyzedAt}ms
+                          {' '}· localAppliedAt={timing.localAppliedAt !== null ? `+${timing.localAppliedAt - timing.analyzedAt}ms` : '—'}
+                          {' '}· serverAppliedAt={timing.serverAppliedAt !== null ? `+${timing.serverAppliedAt - timing.analyzedAt}ms` : '—'}
+                        </div>
+                      )}
+                      {timing && (
+                        <div>
+                          localUiLatency={timing.localUiLatency !== null ? `${timing.localUiLatency}ms` : '—'}
+                          {' '}· serverRoundTripLatency={timing.serverRoundTripLatency !== null ? `${timing.serverRoundTripLatency}ms` : '—'}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {Object.keys(runwayDebug).length === 0 && <div className="text-gray-600">尚無任何 taxiway 的判定資料</div>}
+              </div>
+            </div>
+
             <div className="text-xs text-gray-600 pt-2 border-t border-gray-800">
               Z1/Z2/Z3 是固定的操作員約定，供 AirportSimPanel（機場地面模擬）判讀一台飛機「進入聯絡道 → 跑道頭等待 → 起飛」三個階段用；Z4 以後的區域一樣能框選、對應聯絡道，只是沒有特殊語意。
-              同一波偵測（不論哪個來源）{(TRIGGER_COOLDOWN_MS / 1000 / playbackRate).toFixed(1)} 秒內只觸發一次，並自動把跑道保護撥到警戒狀態
-              {(RUNWAY_ALERT_DURATION_MS / 1000 / playbackRate).toFixed(1)} 秒（依目前 ×{playbackRate} 播放速度等比例縮短，STM 沒開會先自動開機）。
+              Z1/Z2/Z3 只會延長跑道警戒倒數（{(RUNWAY_ALERT_DURATION_MS / 1000 / playbackRate).toFixed(1)} 秒，依目前 ×{playbackRate} 播放速度等比例縮短），不會自行發出入侵警告；只有跨越跑道入侵線、且通過上方「canIssueIncursionAlert」Gate（系統 RUNNING、監控啟用、跑道已警戒）才會真的發出警告與寫入正式紀錄。
+              系統未啟動或跑道未警戒時不會自動開機/自動警戒——需操作員自行啟動系統、開啟跑道保護。
               最後更新：{config.updated_at} · 修改後記得按「儲存」。
             </div>
           </div>

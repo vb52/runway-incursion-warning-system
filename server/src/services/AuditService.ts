@@ -92,6 +92,17 @@ class AuditService {
     const db = getDb();
     return db.prepare('SELECT * FROM audit_logs WHERE id = ?').get(id) as AuditLog | undefined;
   }
+
+  // Exception to the append-only rule above: called ONLY from the demo
+  // reset route (POST /api/demo/reset), never exposed as its own endpoint —
+  // there is no route that lets a client delete an individual or arbitrary
+  // set of audit rows. Mirrors EventService.deleteAllEvents(), which the
+  // same reset route already calls for the events tables.
+  deleteAllLogs(): void {
+    const db = getDb();
+    db.exec('DELETE FROM audit_logs');
+    logger.warn('[AUDIT] All audit logs deleted (demo reset).');
+  }
 }
 
 export const auditService = new AuditService();

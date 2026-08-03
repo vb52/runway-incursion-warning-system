@@ -241,10 +241,16 @@ class SystemStateService {
     return { success: true };
   }
 
-  resetTaxiway(id: TaxiwayId): { success: boolean; error?: string } {
+  resetTaxiway(id: TaxiwayId): { success: boolean; error?: string; alreadyCleared?: boolean } {
     const current = this.taxiways.get(id);
     if (current !== 'INCURSION_LATCHED') {
-      return { success: false, error: `Taxiway ${id} is not in INCURSION_LATCHED state.` };
+      // Idempotent: a 復歸/reset call's goal is "this taxiway is not
+      // latched" — if that's already true (e.g. the operator's click raced
+      // a server-side clear that had just landed, or a duplicate request),
+      // there is nothing left to do. Report success, not failure — see
+      // taxiwayRoutes.ts's /:id/reset for why this must never surface as an
+      // operation-failed error to the operator.
+      return { success: true, alreadyCleared: true };
     }
 
     // SAFETY: Red taxiway reset goes to GUARDED (not AUTHORIZED)

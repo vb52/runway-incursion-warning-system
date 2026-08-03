@@ -57,8 +57,10 @@ export function setupSocketHandlers(io: SocketIOServer): void {
     // so a real video detection visibly shows up in the ground-sim diagram
     // instead of the two staying visually disconnected. Pure relay, no
     // server-side state — momentary visual event, nothing to replay to a
-    // late-joining client.
-    socket.on('sim:spawn-at-taxiway', (payload: { taxiway_id?: string; event?: string }) => {
+    // late-joining client. event_id (optional) identifies the specific
+    // AircraftEvent that triggered this — passed through unexamined so
+    // AirportSimPanel can target/dedup by identity.
+    socket.on('sim:spawn-at-taxiway', (payload: { taxiway_id?: string; event?: string; event_id?: string }) => {
       if (typeof payload?.taxiway_id !== 'string') return;
       // Respect the same grace window as arm() (see DetectorAlertService.
       // isSuppressed/suppress) — right after an operator RESET or manual
@@ -69,12 +71,12 @@ export function setupSocketHandlers(io: SocketIOServer): void {
       if (detectorAlertService.isSuppressed()) return;
       // ENTERING (Z1 creates a new AircraftEvent — the only event that may
       // spawn a fresh vehicle), RUNWAY_HOLDING (Z2 binds to that event, entry
-      // animation plays), or TAKEOFF (Z3 motion confirmed + entry animation
-      // completed) — see ZoneConfig.tsx's AircraftEvent state machine. Each
-      // is a one-time transition already fully judged there, never
-      // re-derived or re-interpreted here.
+      // animation plays), or TAKEOFF (Z3 — highest priority, fires from any
+      // state) — see ZoneConfig.tsx's AircraftEvent state machine. Each is a
+      // one-time transition already fully judged there, never re-derived or
+      // re-interpreted here.
       if (payload.event !== 'TAKEOFF' && payload.event !== 'RUNWAY_HOLDING' && payload.event !== 'ENTERING') return;
-      io.emit('sim:spawn-at-taxiway', { taxiway_id: payload.taxiway_id, event: payload.event });
+      io.emit('sim:spawn-at-taxiway', { taxiway_id: payload.taxiway_id, event: payload.event, event_id: payload.event_id });
     });
 
     // ZoneConfig.tsx's source video jumped to a different time (seek bar
@@ -91,26 +93,26 @@ export function setupSocketHandlers(io: SocketIOServer): void {
 
     // AirportSimPanel.tsx reports back once a LIVE-tracked vehicle's own
     // animation actually reaches the runway-head position (simStep's
-    // TAXI_OUT -> AT_JUNCTION transition) — ZoneConfig.tsx's
-    // activeAircraftEventsRef state machine uses this to know the entry
-    // animation genuinely finished (real animation-timing knowledge only
-    // AirportSimPanel has), gating takeoff on it so it can never start while
-    // that animation is still visibly playing. Pure relay, no server-side
-    // state — same momentary-event shape as sim:spawn-at-taxiway above.
-    socket.on('sim:aircraft-at-runway-head', (payload: { taxiway_id?: string }) => {
+    // TAXI_TO_HEAD -> AT_JUNCTION transition) — ZoneConfig.tsx's
+    // activeAircraftEventsRef state machine uses this (for the NORMAL,
+    // non-Z3-preempted path) to know the entry animation genuinely finished.
+    // Pure relay, no server-side state — same momentary-event shape as
+    // sim:spawn-at-taxiway above. event_id lets ZoneConfig.tsx target the
+    // specific event.
+    socket.on('sim:aircraft-at-runway-head', (payload: { taxiway_id?: string; event_id?: string }) => {
       if (typeof payload?.taxiway_id !== 'string') return;
-      io.emit('sim:aircraft-at-runway-head', { taxiway_id: payload.taxiway_id });
+      io.emit('sim:aircraft-at-runway-head', { taxiway_id: payload.taxiway_id, event_id: payload.event_id });
     });
 
     // AirportSimPanel.tsx reports back once a LIVE-tracked vehicle's takeoff
-    // animation actually completes — ZoneConfig.tsx clears that taxiway's
+    // animation actually completes — ZoneConfig.tsx removes that specific
     // AircraftEvent so a genuinely later, new Z1 detection (a second plane
     // departing from the same taxiway later in the same video loop) can
     // start a fresh event instead of being blocked for the rest of the
     // session. Pure relay, no server-side state.
-    socket.on('sim:aircraft-departed', (payload: { taxiway_id?: string }) => {
+    socket.on('sim:aircraft-departed', (payload: { taxiway_id?: string; event_id?: string }) => {
       if (typeof payload?.taxiway_id !== 'string') return;
-      io.emit('sim:aircraft-departed', { taxiway_id: payload.taxiway_id });
+      io.emit('sim:aircraft-departed', { taxiway_id: payload.taxiway_id, event_id: payload.event_id });
     });
 
     // DEBUG: Ping/pong for connection testing

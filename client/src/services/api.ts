@@ -73,7 +73,7 @@ export const taxiwayApi = {
       body: JSON.stringify({ operator_name: operatorName }),
     }),
   reset: (id: string, operatorName = 'ATC-01') =>
-    apiCall(`/taxiways/${id}/reset`, {
+    apiCall<{ success: boolean; alreadyCleared?: boolean; message?: string }>(`/taxiways/${id}/reset`, {
       method: 'POST',
       body: JSON.stringify({ operator_name: operatorName }),
     }),
@@ -175,8 +175,14 @@ export const demoApi = {
     // detection — see ZoneConfig.tsx's incursion-line scanning. Becomes
     // the event's real DETECTION_IMAGE instead of the generated placeholder.
     snapshot_base64?: string;
+    // The client-generated alertEventId (see aiDetectionStateStore's
+    // buildAlertEventId) that triggered this call — carried through purely
+    // for backend audit traceability (see demoRoutes.ts). The client
+    // correlates it with the returned eventId itself; the backend never
+    // needs to echo it back for that to work.
+    alert_event_id?: string;
   }) =>
-    apiCall('/demo/detect', {
+    apiCall<{ success: boolean; message?: string; data?: { eventId?: string; eventCode?: string; actions?: string[] } }>('/demo/detect', {
       method: 'POST',
       body: JSON.stringify(params),
     }),

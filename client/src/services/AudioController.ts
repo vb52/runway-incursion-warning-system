@@ -65,6 +65,21 @@ export function clearPlayedAlerts(): void {
   playedAlertIds.clear();
 }
 
+// Stops whatever alert audio is currently playing right now — used when the
+// operator explicitly dismisses an incursion alert's toast (see
+// dismissAlertLocally in aiDetectionStateStore.ts) so closing the popup also
+// silences its sound immediately, instead of letting the in-progress
+// "Check Runway!" utterance keep speaking after the window is gone. Only
+// cancels playback; does NOT touch playedAlertIds, so the same eventId still
+// can never trigger a second playCheckRunway later.
+export function stopCheckRunwayAlert(): void {
+  try {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+  } catch (err) {
+    console.warn('[AUDIO] Failed to stop alert:', err);
+  }
+}
+
 export function hasPlayedAlert(eventId: string): boolean {
   return playedAlertIds.has(eventId);
 }

@@ -7,6 +7,7 @@ import { AirportSimPanel, AirportSimPanelHandle } from '../components/AirportSim
 import { VideoFeed } from '../components/VideoFeed';
 import { useDetectorAlert } from '../hooks/useDetectorAlert';
 import { getSocket } from '../services/socketService';
+import { useLocallyLatchedTaxiways } from '../stores/aiDetectionStateStore';
 
 // ── Colour helpers ─────────────────────────────────────────────────────────────
 
@@ -232,7 +233,21 @@ function Pill({ label, sub, active, color, pulsing = false }: {
 export function LiveMonitor() {
   const { state, dispatch, addToast } = useAppStore();
   const systemState = state.systemState;
-  const taxiways = systemState?.taxiways ?? [];
+  const serverTaxiways = systemState?.taxiways ?? [];
+  // Local-first overlay — see aiDetectionStateStore's module doc. A taxiway
+  // ZoneConfig.tsx's own AI 判讀 already flagged as incursion-latched (or the
+  // server has since confirmed) reads as INCURSION_LATCHED here immediately,
+  // without waiting for THIS specific taxiway's server broadcast to land —
+  // once it does, the server's own state already agrees, so there is no
+  // visible "flip". Never invents a state the server hasn't (or won't)
+  // confirm — only ever forces the LATCHED color on, never off (going back
+  // to GUARDED/OFF/AUTHORIZED always waits for the real server broadcast).
+  const locallyLatched = useLocallyLatchedTaxiways();
+  const taxiways = serverTaxiways.map((t) =>
+    t.state !== 'INCURSION_LATCHED' && locallyLatched.has(t.id)
+      ? { ...t, state: 'INCURSION_LATCHED' as const }
+      : t
+  );
   const hasIncursion = taxiways.some(t => t.state === 'INCURSION_LATCHED');
   const isActive = systemState?.powerState === 'ACTIVE';
   const isRwyOn = systemState?.runwayProtectionState === 'ON';
@@ -259,11 +274,23 @@ export function LiveMonitor() {
   const northIds = ALL_TAXIWAY_IDS.filter(id => id.endsWith('N')) as TaxiwayId[];
   const southIds = ALL_TAXIWAY_IDS.filter(id => id.endsWith('S')) as TaxiwayId[];
 
+  // In-flight guard — this is the explicit 解除警報/授權/撤銷 action (unlike
+  // the alert toast's X, this DOES call the backend), so a rapid double-
+  // click must not fire the request twice and risk two error/success toasts
+  // for the same click.
+  const pendingTaxiwayActionsRef = useRef<Set<TaxiwayId>>(new Set());
+
   const handleTaxiwayClick = useCallback(async (id: TaxiwayId) => {
     const tw = taxiways.find(t => t.id === id);
     if (!tw) return;
+    if (pendingTaxiwayActionsRef.current.has(id)) return;
+    pendingTaxiwayActionsRef.current.add(id);
     try {
       if (tw.state === 'INCURSION_LATCHED') {
+        // taxiwayApi.reset is now idempotent server-side (200 +
+        // alreadyCleared:true if the taxiway raced back to non-latched
+        // already) — this always reads as success from here, never the
+        // "Taxiway ... is not in INCURSION_LATCHED state" error it used to.
         await taxiwayApi.reset(id);
         addToast({ type: 'success', title: `聯絡道 ${id} 已復歸`, duration: 2000 });
       } else if (tw.state === 'AUTHORIZED') {
@@ -274,7 +301,12 @@ export function LiveMonitor() {
         addToast({ type: 'success', title: `聯絡道 ${id} 已授權`, duration: 2000 });
       }
     } catch (err) {
+      // Only genuine failures land here now (network error, 4xx/5xx other
+      // than the idempotent reset case, etc.) — see taxiwayApi.reset/
+      // resetTaxiway's comments.
       addToast({ type: 'error', title: '操作失敗', message: err instanceof Error ? err.message : '未知錯誤' });
+    } finally {
+      pendingTaxiwayActionsRef.current.delete(id);
     }
   }, [taxiways, addToast]);
 
@@ -305,18 +337,32 @@ export function LiveMonitor() {
   // only go to GUARDED, never straight to AUTHORIZED) is reused as-is rather
   // than re-implemented. Unlike RESET (handleFullReset), this doesn't touch
   // STM/RWY state, events, or the simulation panel — just the alerts.
+  // Click-dedup: hasIncursion (the button's own disabled condition) doesn't
+  // flip false until the server round trip lands, so a rapid double-click
+  // could otherwise fan out two overlapping batches of reset calls.
+  const isOmittingRef = useRef(false);
+
   const handleOmitAllIncursions = async () => {
+    if (isOmittingRef.current) return;
     const latched = taxiways.filter((t) => t.state === 'INCURSION_LATCHED').map((t) => t.id);
     if (latched.length === 0) return;
 
-    const results = await Promise.allSettled(latched.map((id) => taxiwayApi.reset(id)));
-    const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+    isOmittingRef.current = true;
+    try {
+      // Idempotent server-side now — a taxiway that already cleared itself
+      // (e.g. raced with its own per-taxiway button) reports
+      // alreadyCleared:true, not a rejection, so it still counts here.
+      const results = await Promise.allSettled(latched.map((id) => taxiwayApi.reset(id)));
+      const succeeded = results.filter((r) => r.status === 'fulfilled').length;
 
-    if (succeeded > 0) {
-      addToast({ type: 'success', title: `已忽略 ${succeeded} 個入侵告警`, duration: 2500 });
-    }
-    if (succeeded < latched.length) {
-      addToast({ type: 'error', title: `${latched.length - succeeded} 個復歸失敗`, duration: 3000 });
+      if (succeeded > 0) {
+        addToast({ type: 'success', title: `已忽略 ${succeeded} 個入侵告警`, duration: 2500 });
+      }
+      if (succeeded < latched.length) {
+        addToast({ type: 'error', title: `${latched.length - succeeded} 個復歸失敗`, duration: 3000 });
+      }
+    } finally {
+      isOmittingRef.current = false;
     }
   };
 
@@ -337,8 +383,8 @@ export function LiveMonitor() {
   // always-mounted LiveMonitor/ZoneConfigPage).
   useEffect(() => {
     const socket = getSocket();
-    const onSpawn = (data: { taxiway_id: string; event: 'TAKEOFF' | 'RUNWAY_HOLDING' | 'ENTERING' }) => {
-      simPanelRef.current?.spawnAt(data.taxiway_id, data.event);
+    const onSpawn = (data: { taxiway_id: string; event: 'TAKEOFF' | 'RUNWAY_HOLDING' | 'ENTERING'; event_id?: string }) => {
+      simPanelRef.current?.spawnAt(data.taxiway_id, data.event, data.event_id ?? '');
     };
     socket.on('sim:spawn-at-taxiway', onSpawn);
     return () => { socket.off('sim:spawn-at-taxiway', onSpawn); };
@@ -346,9 +392,8 @@ export function LiveMonitor() {
 
   // The source video jumped to a different time (see ZoneConfig.tsx's
   // handleVideoSeeking) — every taxiway's old Z1/Z2/Z3 state is now
-  // meaningless, so drop any LIVE-tracked vehicle instead of leaving it
-  // frozen mid-animation at a position that no longer corresponds to
-  // anything. DEMO vehicles are untouched (see clearLiveVehicles).
+  // meaningless, so drop every tracked vehicle instead of leaving it frozen
+  // mid-animation at a position that no longer corresponds to anything.
   useEffect(() => {
     const socket = getSocket();
     const onSeeking = () => simPanelRef.current?.clearLive();

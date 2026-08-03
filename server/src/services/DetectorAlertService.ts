@@ -12,10 +12,6 @@ import { logger } from '../utils/logger';
 // VideoFeed can show the same "跑道警戒中" countdown the detector page shows,
 // instead of it only existing on whichever tab happened to arm it.
 const OPERATOR_NAME = 'AI-DETECTOR';
-// STM INITIALIZING -> ACTIVE takes 1.5s (SystemStateService.startSystem's
-// setTimeout) — wait a little past that before trying RWY enable, which
-// requires ACTIVE.
-const STM_START_SETTLE_MS = 1700;
 // After an operator's explicit "give me a clean state" action — clearing
 // the detector's own alert (DetectorConfig.tsx's RESET, AirportSimPanel's
 // panel-local RESET — see clear()'s suppress param) or manually starting the
@@ -92,53 +88,32 @@ class DetectorAlertService {
     this.io?.emit('detector:demo-reset');
   }
 
-  // Arms (or extends, if already armed) the alert window for durationMs,
-  // auto-starting STM and enabling RWY protection first if needed — same
-  // logic DetectorConfig.tsx's armRunwayAlert used to do client-side.
+  // Arms (or extends, if already armed) the alert window for durationMs.
   //
-  // mayCreate=false (ZoneConfig.tsx's Z2/Z3 motion-zone hits — operator
-  // request: "TRIGGER自動警戒一定要Z1觸發，只有告警觸發後Z2/Z3延長") means
-  // this call may only EXTEND an alert that's already active; it must never
-  // start a fresh one on its own. Checked here (server-owned alertUntil is
-  // the single source of truth) rather than against the client's own local
-  // copy, which can lag a socket round-trip behind. Only Z1 (mayCreate left
-  // at its default true) may ever transition alertUntil from null -> armed.
+  // Does NOT auto-start STM or auto-enable RWY protection — an operator must
+  // already have both running before any detection source can create or
+  // extend an alert. A detection arriving while the system is off/runway
+  // unprotected is simply dropped: there is nothing "protected" for it to
+  // warn about yet, and silently powering the system on in reaction to a
+  // motion/AI hit is not something a detection should ever be able to do.
+  //
+  // mayCreate=false (ZoneConfig.tsx's Z1/Z2/Z3 taxiway-tracking motion-zone
+  // hits) means this call may only EXTEND an alert that's already active; it
+  // must never start a fresh one on its own. Checked here (server-owned
+  // alertUntil is the single source of truth) rather than against the
+  // client's own local copy, which can lag a socket round-trip behind. Only
+  // the 跑道入侵線 (mayCreate left at its default true) may ever transition
+  // alertUntil from null -> armed.
   async arm(durationMs: number, mayCreate = true): Promise<void> {
     if (this.suppressUntil !== null) {
       if (Date.now() < this.suppressUntil) return;
       this.suppressUntil = null;
     }
 
+    if (systemStateService.getPowerState() !== 'ACTIVE') return;
+    if (systemStateService.getRunwayProtectionState() !== 'ON') return;
+
     if (!mayCreate && this.alertUntil === null) return;
-
-    if (systemStateService.getPowerState() !== 'ACTIVE') {
-      const previousState = systemStateService.getPowerState();
-      const result = systemStateService.startSystem();
-      auditService.logAction({
-        action_type: 'SYSTEM_START',
-        target_type: 'SYSTEM',
-        operator_name: OPERATOR_NAME,
-        previous_state: previousState,
-        new_state: 'INITIALIZING',
-        result: result.success ? 'SUCCESS' : 'FAILED',
-        metadata: result.error ? { error: result.error } : undefined,
-      });
-      await new Promise((r) => setTimeout(r, STM_START_SETTLE_MS));
-    }
-
-    if (systemStateService.getRunwayProtectionState() !== 'ON') {
-      const previousState = systemStateService.getRunwayProtectionState();
-      const result = systemStateService.enableRunwayProtection();
-      auditService.logAction({
-        action_type: 'RUNWAY_ENABLE',
-        target_type: 'RUNWAY',
-        operator_name: OPERATOR_NAME,
-        previous_state: previousState,
-        new_state: result.success ? 'ON' : previousState,
-        result: result.success ? 'SUCCESS' : 'FAILED',
-        metadata: result.error ? { error: result.error } : undefined,
-      });
-    }
 
     this.alertUntil = Date.now() + durationMs;
     this.io?.emit('detector:alert-armed', this.getState());

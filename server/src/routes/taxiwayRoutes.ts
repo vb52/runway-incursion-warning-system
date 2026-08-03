@@ -84,6 +84,16 @@ router.post('/:id/reset', (req: Request, res: Response) => {
   const previousState = systemStateService.getTaxiwayState(id);
   const result = systemStateService.resetTaxiway(id);
 
+  // Idempotent no-op (taxiway was already not INCURSION_LATCHED) — nothing
+  // changed, so this isn't audit-worthy and must not be reported as FAILED:
+  // the caller's intent ("this taxiway should not be latched") is already
+  // satisfied. Still HTTP 200 with an explicit flag so the client can tell
+  // "already done" apart from "just did it" without treating either as an
+  // error.
+  if (result.alreadyCleared) {
+    return res.json({ success: true, alreadyCleared: true, message: `Taxiway ${id} was already cleared.` });
+  }
+
   auditService.logAction({
     action_type: 'TAXIWAY_RESET',
     target_type: 'TAXIWAY',

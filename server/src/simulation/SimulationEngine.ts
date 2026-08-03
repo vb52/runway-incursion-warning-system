@@ -26,6 +26,10 @@ export interface DetectionResult {
   // When present, this becomes the event's actual DETECTION_IMAGE instead of
   // the generated placeholder (see MediaGeneratorService.saveDetectionSnapshot).
   snapshotBase64?: string;
+  // Client-generated alertEventId (see aiDetectionStateStore.ts's
+  // buildAlertEventId) — passed through to EventService.createEvent purely
+  // for audit-trail traceability. See CreateEventInput.alertEventId.
+  alertEventId?: string;
 }
 
 export interface ScenarioResult {
@@ -119,6 +123,7 @@ class SimulationEngine {
       stm_state: 'ACTIVE',
       runway_state: 'ON',
       taxiway_state_at_detection: taxiwayState,
+      alertEventId: detection.alertEventId,
       detected_at: detection.detected_at ?? nowIso(),
     });
 

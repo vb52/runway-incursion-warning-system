@@ -63,6 +63,11 @@ router.post('/reset', (_req: Request, res: Response) => {
   // Clear all events
   eventService.deleteAllEvents();
 
+  // Clear all audit log entries too (操作紀錄頁面) — run before the
+  // DEMO_RESET entry below is written, so that entry is the one thing left
+  // recording the reset itself, not also wiped by its own cleanup.
+  auditService.deleteAllLogs();
+
   auditService.logAction({
     action_type: 'DEMO_RESET',
     target_type: 'SYSTEM',
@@ -86,6 +91,11 @@ router.post('/detect', async (req: Request, res: Response) => {
   // DetectorConfig.tsx) — optional, JSON body so no multipart/upload
   // handling needed. Anything else keeps working exactly as before.
   const snapshotBase64 = typeof body.snapshot_base64 === 'string' ? body.snapshot_base64 : undefined;
+  // Client-generated alertEventId (see aiDetectionStateStore.ts's
+  // buildAlertEventId) — optional, purely for audit-trail traceability. See
+  // SimulationEngine.DetectionResult.alertEventId / EventService.
+  // CreateEventInput.alertEventId.
+  const alertEventId = typeof body.alert_event_id === 'string' ? body.alert_event_id : undefined;
 
   if (!taxiwayId) {
     return res.status(400).json({ success: false, error: 'taxiway_id is required.' });
@@ -99,6 +109,7 @@ router.post('/detect', async (req: Request, res: Response) => {
     confidence,
     enteringRunway,
     snapshotBase64,
+    alertEventId,
   });
 
   if (!result.success) {
