@@ -15,14 +15,14 @@ import { getDetectorVideoElement, onDetectorVideoElementChange } from '../servic
 // two full decodes running at once any time the operator was actually on
 // 主戰情表 (this page), the most common place to notice choppy playback.
 //
-// Because there's no local <video> element anymore, seeking/changing speed
-// from this page acts directly on the shared element (ZoneConfig.tsx's),
-// then broadcasts the change via Socket.IO the same way it always did — that
-// page's own useVideoSync instance is what actually keeps the shared element
-// drift-corrected; this component only reads from it and forwards operator
-// input to it.
-const SPEED_OPTIONS = [1, 2, 3, 5];
-
+// Because there's no local <video> element anymore, seeking from this page
+// acts directly on the shared element (ZoneConfig.tsx's), then broadcasts
+// the change via Socket.IO the same way it always did — that page's own
+// useVideoSync instance is what actually keeps the shared element drift-
+// corrected; this component only reads from it and forwards operator input
+// to it. Playback speed is fixed at 1x (operator request: 影片播放速度訂死在
+// 正常，不要加快) — no UI to change it, and any stray playbackRate on the
+// shared element gets pinned back to 1 below.
 function formatTime(s: number): string {
   if (!isFinite(s) || s < 0) return '0:00';
   const m = Math.floor(s / 60);
@@ -33,7 +33,6 @@ function formatTime(s: number): string {
 export function VideoFeed({ className }: { className?: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef(0);
-  const [playbackRate, setPlaybackRate] = useState(3);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [connected, setConnected] = useState(false);
@@ -88,16 +87,18 @@ export function VideoFeed({ className }: { className?: string }) {
     return () => { cancelled = true; cancelAnimationFrame(rafRef.current); };
   }, [isVisible]);
 
-  // currentTime/duration/playbackRate readout for the seek bar + speed
-  // buttons — listens directly on whichever element is currently registered
-  // (re-attaches if that ever changes, see onDetectorVideoElementChange).
+  // currentTime/duration readout for the seek bar — listens directly on
+  // whichever element is currently registered (re-attaches if that ever
+  // changes, see onDetectorVideoElementChange). Also pins playbackRate back
+  // to 1 if it ever drifts (e.g. a stale server-synced value from before
+  // speed control was removed) — see the module doc.
   useEffect(() => {
     let cleanup = () => {};
     const attach = (video: HTMLVideoElement | null) => {
       if (!video) { cleanup = () => {}; return; }
       const onTime = () => {
         setCurrentTime(video.currentTime);
-        setPlaybackRate(video.playbackRate);
+        if (video.playbackRate !== 1) video.playbackRate = 1;
       };
       const onMeta = () => setDuration(video.duration || 0);
       video.addEventListener('timeupdate', onTime);
@@ -117,20 +118,14 @@ export function VideoFeed({ className }: { className?: string }) {
     return () => { cleanup(); unsubscribe(); };
   }, []);
 
-  const applyRate = (rate: number) => {
-    const video = getDetectorVideoElement();
-    if (!video) return;
-    video.playbackRate = rate;
-    setPlaybackRate(rate);
-    getSocket().emit('video:update', { playbackRate: rate, currentTime: video.currentTime });
-  };
-
   const seek = (t: number) => {
     const video = getDetectorVideoElement();
     if (!video) return;
     video.currentTime = t;
     setCurrentTime(t);
-    getSocket().emit('video:update', { playbackRate: video.playbackRate, currentTime: t });
+    // Playback speed is fixed at 1x — always publish 1, never whatever the
+    // element's own playbackRate happens to read (see the module doc).
+    getSocket().emit('video:update', { playbackRate: 1, currentTime: t });
   };
 
   // Reloads the actual shared source (ZoneConfig.tsx's <video>) — fixes
@@ -165,20 +160,9 @@ export function VideoFeed({ className }: { className?: string }) {
             {formatTime(currentTime)} / {formatTime(duration)}
           </span>
           <div className="flex items-center gap-1">
-            {SPEED_OPTIONS.map((r) => (
-              <button
-                key={r}
-                onClick={() => applyRate(r)}
-                className="font-mono text-[9px] px-1.5 py-0.5 rounded border transition-colors"
-                style={{
-                  background: playbackRate === r ? 'rgba(0,255,136,0.08)' : 'transparent',
-                  borderColor: playbackRate === r ? '#00ff88' : '#374151',
-                  color: playbackRate === r ? '#00ff88' : '#6b7280',
-                }}
-              >
-                ×{r}
-              </button>
-            ))}
+            <span className="font-mono text-[9px] px-1.5 py-0.5 rounded border border-[#374151] text-[#6b7280]">
+              ×1
+            </span>
             <button
               onClick={reloadVideo}
               title="影片畫面卡住時點這裡重新載入"

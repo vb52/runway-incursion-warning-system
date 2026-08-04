@@ -168,7 +168,26 @@ interface TaxiwayRuntimeState {
   // eventId (see publishAiDetectionSnapshot in ZoneConfig.tsx), so it is
   // never affected by this.
   dismissedAlertEventIds: Set<string>;
+  // Date.now() ms until which NO LOCAL_AI incursion may latch for this
+  // taxiway, for ANY eventId — not just the one that was just cleared.
+  // Set by clearIncursionLatch (manual 復歸 — see its comment): the operator
+  // requirement is "手動按掉警報為最高優先級，復歸後30秒不再響警報" (dismissing
+  // is the highest-priority action; the alarm stays quiet for 30s after,
+  // full stop). suppressedEventId alone only protects against the SAME
+  // lingering eventId re-latching forever; this additionally blocks even a
+  // genuinely different-looking new eventId for the 30s window, matching
+  // the same grace period DetectorAlertService.suppress() opens server-side
+  // (see taxiwayRoutes.ts's /reset). After the window closes, the ordinary
+  // suppressedEventId/new-eventId rules apply as normal.
+  manualSuppressUntil: number;
 }
+
+// Operator requirement: 復歸後30秒不再響警報 — kept in lockstep with
+// DetectorAlertService's own SUPPRESS_BASE_MS on the server (see
+// taxiwayRoutes.ts's /reset), though the two are independent mechanisms
+// (this one covers the LOCAL_AI popup/sound path; the server's covers arm()/
+// backend detection).
+const MANUAL_ALERT_SUPPRESS_MS = 30000;
 
 type Listener = () => void;
 
@@ -205,6 +224,7 @@ function getOrCreateState(taxiwayId: TaxiwayId): TaxiwayRuntimeState {
       lastLocalAlertAt: null,
       suppressedEventId: null,
       dismissedAlertEventIds: new Set(),
+      manualSuppressUntil: 0,
     };
     taxiwayStates.set(taxiwayId, state);
   }
@@ -237,6 +257,7 @@ export function resetGeneration(): number {
     state.lastLocalAlertAt = null;
     state.suppressedEventId = null;
     state.dismissedAlertEventIds.clear();
+    state.manualSuppressUntil = 0;
     notify(taxiwayId);
   }
   return currentGenerationId;
@@ -294,6 +315,10 @@ export function clearIncursionLatch(taxiwayId: TaxiwayId): void {
   // camera hasn't actually stopped seeing the aircraft) doesn't immediately
   // re-latch it — see the suppressedEventId field's comment.
   state.suppressedEventId = state.snapshot?.eventId ?? null;
+  // 手動按掉警報為最高優先級，復歸後30秒不再響警報 — see manualSuppressUntil's
+  // comment. Broader than suppressedEventId: blocks ANY LOCAL_AI incursion
+  // for this taxiway (not just the one just cleared) for the full window.
+  state.manualSuppressUntil = Date.now() + MANUAL_ALERT_SUPPRESS_MS;
   if (state.snapshot) state.snapshot = { ...state.snapshot, decision: { ...state.snapshot.decision, incursionLatched: false } };
   notify(taxiwayId);
 }
@@ -382,6 +407,14 @@ export function applyRunwayStateUpdate(snapshot: AiDetectionSnapshot): void {
   // publishAiDetectionSnapshot in ZoneConfig.tsx), so it is never
   // suppressed by this.
   if (snapshot.source === 'LOCAL_AI' && state.suppressedEventId !== null && snapshot.eventId === state.suppressedEventId) {
+    effectiveIncursionLatched = false;
+  }
+
+  // 手動按掉警報為最高優先級，復歸後30秒不再響警報 — broader than the eventId
+  // check above: blocks ANY LOCAL_AI incursion for this taxiway (even a
+  // different-looking eventId) until the window closes. See
+  // manualSuppressUntil's comment.
+  if (snapshot.source === 'LOCAL_AI' && Date.now() < state.manualSuppressUntil) {
     effectiveIncursionLatched = false;
   }
 

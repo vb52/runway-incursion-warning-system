@@ -4,6 +4,7 @@ import { TaxiwayState, TaxiwayId } from '../types';
 import { demoApi, taxiwayApi, detectorApi } from '../services/api';
 import { useAppStore } from '../stores/appStore';
 import { getSocket } from '../services/socketService';
+import { useDetectorAlert } from '../hooks/useDetectorAlert';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -358,6 +359,17 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
 
   const [running, setRunning] = useState(false);
   const [trackCount, setTrackCount] = useState(0);
+  // Runway alert countdown (Z1/motion/incursion-line arm this — see
+  // armRunwayAlert in ZoneConfig.tsx) — same server-synced value LiveMonitor's
+  // main panel and the CAM-01 preview show, surfaced here too so this panel
+  // itself visibly reacts to Z1 firing, not just the taxiway junction dots.
+  const alertUntil = useDetectorAlert();
+  const [alertNowTick, setAlertNowTick] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setAlertNowTick(Date.now()), 200);
+    return () => clearInterval(id);
+  }, []);
+  const alertSecondsLeft = alertUntil ? Math.max(0, Math.ceil((alertUntil - alertNowTick) / 1000)) : 0;
   // Gates spawnAtTaxiway (see below) — off by default. Lifted to the shared
   // AppStore (not a local useState here) so ZoneConfig.tsx's detection tick
   // loop can also read it — real detections must not auto-arm runway
@@ -938,6 +950,18 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
           <span className="font-mono text-[10px] text-[#555] tracking-widest uppercase">機場地面模擬</span>
           <span className="font-mono text-[10px] text-[#333]">|</span>
           <span className="font-mono text-[10px] text-[#444]">{trackCount} 個目標</span>
+          {alertSecondsLeft > 0 && (
+            <>
+              <span className="font-mono text-[10px] text-[#333]">|</span>
+              <span
+                className="font-mono text-[10px] flex items-center gap-1"
+                style={{ color: '#FF8800' }}
+              >
+                <span className="w-1.5 h-1.5 rounded-full" style={{ background: '#FF8800', boxShadow: '0 0 4px #FF8800' }} />
+                警戒中 · {alertSecondsLeft}s
+              </span>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-1.5">
           <button

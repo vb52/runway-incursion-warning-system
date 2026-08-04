@@ -500,6 +500,16 @@ export function LiveMonitor() {
         >
           <Pill label="STM" sub={systemState?.powerState ?? 'OFF'} active={isActive} color="#00FF88"/>
           <Pill label="RWY" sub={isRwyOn ? 'ON' : 'OFF'} active={isRwyOn} color="#FFD700"/>
+          {/* Runway alert countdown (Z1/motion/incursion-line arm this — see
+              armRunwayAlert in ZoneConfig.tsx) — previously only visible in a
+              small badge next to the CAM-01 preview; surfaced here too so
+              the main panel itself visibly reacts the instant Z1 fires, not
+              just the taxiway colors/incursion light. */}
+          <Pill
+            label="警戒"
+            sub={alertSecondsLeft > 0 ? `${alertSecondsLeft}s` : 'IDLE'}
+            active={alertSecondsLeft > 0} color="#FF8800" pulsing={alertSecondsLeft > 0}
+          />
           <Pill
             label={hasIncursion ? '⚠ INCURSION' : 'INCURSION'}
             sub={hasIncursion ? 'ACTIVE' : 'CLEAR'}

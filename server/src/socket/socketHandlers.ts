@@ -48,7 +48,10 @@ export function setupSocketHandlers(io: SocketIOServer): void {
 
     socket.on('video:update', (payload: { playbackRate?: number; currentTime?: number }) => {
       if (typeof payload?.playbackRate !== 'number' || typeof payload?.currentTime !== 'number') return;
-      videoSyncService.setState(payload.playbackRate, payload.currentTime);
+      // Playback speed is fixed at 1x (operator request: 影片播放速度訂死在
+      // 正常，不要加快) — pinned server-side too, not just by removing the
+      // client UI, so a stray/stale client can never push it back up.
+      videoSyncService.setState(1, payload.currentTime);
     });
 
     // ZoneConfig.tsx's activeAircraftEventsRef state machine advancing a

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { systemStateService } from '../services/SystemStateService';
 import { auditService } from '../services/AuditService';
+import { detectorAlertService } from '../services/DetectorAlertService';
 import { TaxiwayId, ALL_TAXIWAY_IDS } from '../types';
 
 const router = Router();
@@ -83,6 +84,19 @@ router.post('/:id/reset', (req: Request, res: Response) => {
   const operatorName = (req.body?.operator_name as string) || 'ATC-01';
   const previousState = systemStateService.getTaxiwayState(id);
   const result = systemStateService.resetTaxiway(id);
+
+  // Manual 復歸 is the highest-priority action — open the same 30s grace
+  // window DetectorConfig.tsx's own RESET/AirportSimPanel's panel-local
+  // RESET already use (see DetectorAlertService.suppress) so Z1/motion/AI/
+  // incursion-line detections can't immediately re-arm the runway alert the
+  // operator just dismissed. Deliberately calling suppress() alone here, NOT
+  // the full clear() — clear() also force-disables RWY protection (turning
+  // every non-latched taxiway OFF), which is far too broad a side effect for
+  // a single taxiway's reset button. Applied regardless of whether this call
+  // found a real INCURSION_LATCHED to clear or the taxiway had already
+  // resolved itself (alreadyCleared) — the operator's "I want quiet now"
+  // intent is the same either way.
+  detectorAlertService.suppress();
 
   // Idempotent no-op (taxiway was already not INCURSION_LATCHED) — nothing
   // changed, so this isn't audit-worthy and must not be reported as FAILED:

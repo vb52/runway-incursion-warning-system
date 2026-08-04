@@ -71,7 +71,7 @@ import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
 import { detectorApi, demoApi } from '../services/api';
 import { DetectorConfig, DetectorMotionZone, DetectorRect, ALL_TAXIWAY_IDS, TaxiwayId } from '../types';
-import { useVideoSync } from '../hooks/useVideoSync';
+import { useVideoSync, getLastProgrammaticSeekAt } from '../hooks/useVideoSync';
 import { useDetectorAlert } from '../hooks/useDetectorAlert';
 import { getSocket } from '../services/socketService';
 import { setDetectorVideoElement } from '../services/detectorVideoRegistry';
@@ -129,8 +129,6 @@ const TRIGGER_TOLERANCE_S = 0.35;
 // TensorFlow AI object-detection loop, which never touches the event/
 // animation state machine).
 const AI_DETECTION_INTERVAL_MS = 1000;
-
-const SPEED_OPTIONS = [1, 2, 3, 5];
 
 function formatTime(s: number): string {
   if (!isFinite(s) || s < 0) return '0:00';
@@ -528,9 +526,12 @@ export function ZoneConfigPage() {
     (videoRef as React.MutableRefObject<HTMLVideoElement | null>).current = el;
     setDetectorVideoElement(el);
   }, []);
-  // Default 3x — the source clip is mostly idle taxiing, 3x keeps demo
-  // pacing tighter without needing a shorter/edited source file.
-  const [playbackRate, setPlaybackRate] = useState(3);
+  // Playback speed is fixed at 1x (operator request: 影片播放速度訂死在正常，
+  // 不要加快) — no UI to change it. playbackRate/playbackRateRef are kept
+  // (rather than ripping out every RUNWAY_ALERT_DURATION_MS/playbackRateRef.
+  // current scaling call site) since dividing by a constant 1 is a correct,
+  // harmless no-op; this is just the single place that constant comes from.
+  const [playbackRate] = useState(1);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [nowTick, setNowTick] = useState(Date.now());
@@ -544,19 +545,12 @@ export function ZoneConfigPage() {
   const playbackRateRef = useRef(playbackRate);
   useEffect(() => { playbackRateRef.current = playbackRate; }, [playbackRate]);
 
-  const applyRate = (rate: number) => {
-    setPlaybackRate(rate);
-    if (videoRef.current) {
-      videoRef.current.playbackRate = rate;
-      publish(rate, videoRef.current.currentTime);
-    }
-  };
-
   const seek = (t: number) => {
     setCurrentTime(t);
     if (videoRef.current) {
       videoRef.current.currentTime = t;
-      publish(playbackRate, t);
+      // Always publish 1 — see playbackRate's comment above.
+      publish(1, t);
     }
   };
 
@@ -938,6 +932,27 @@ export function ZoneConfigPage() {
     const newTime = videoRef.current?.currentTime ?? 0;
     const jump = Math.abs(newTime - lastVideoTimeRef.current);
     if (jump < SMALL_SEEK_IGNORE_S) return;
+
+    // useVideoSync's OWN drift correction can occasionally be LARGE (past
+    // SMALL_SEEK_IGNORE_S) — e.g. right after the video sat stalled/
+    // buffering for a while, "expected" (derived purely from wall-clock
+    // elapsed time) can be many seconds ahead of where playback actually is
+    // by the time it resumes. That correction is still not a real seek; it
+    // was misclassified as one before this check existed, which wiped
+    // activeAircraftEventsRef/the ground-sim vehicles moments after they'd
+    // just been created — reported live as "事件產出飛機後就消失了". Treated
+    // exactly like a loop wrap below: only the frame-diff baselines reset,
+    // events/vehicles are left alone. getLastProgrammaticSeekAt() is tagged
+    // with a timestamp (not a boolean) since the native `seeking` event
+    // dispatches asynchronously — a plain flag set-then-cleared
+    // synchronously around the v.currentTime assignment could clear before
+    // this handler ever runs.
+    const isOwnSyncCorrection = Date.now() - getLastProgrammaticSeekAt() < 500;
+    if (isOwnSyncCorrection) {
+      prevFramesRef.current = new Map();
+      prevZoneHitsRef.current = new Map();
+      return;
+    }
 
     // <video loop> wrapping back to 0 fires this exact same native
     // `seeking` event but is NOT a real seek — the operator didn't ask to
@@ -1637,7 +1652,10 @@ export function ZoneConfigPage() {
   const handleVideoTimeUpdate = (e: React.SyntheticEvent<HTMLVideoElement>) => {
     const t = e.currentTarget.currentTime;
     setCurrentTime(t);
-    setPlaybackRate(e.currentTarget.playbackRate);
+    // Pinned to 1x — see playbackRate's comment. Defensive against a stale
+    // synced value (e.g. a leftover >1 rate from before speed control was
+    // removed) rather than just trusting the element's own rate.
+    if (e.currentTarget.playbackRate !== 1) e.currentTarget.playbackRate = 1;
 
     if (t < lastVideoTimeRef.current - 1) firedThisLoopRef.current.clear(); // `loop` wrapped back to 0
     lastVideoTimeRef.current = t;
@@ -1982,22 +2000,9 @@ export function ZoneConfigPage() {
                 <span className="font-mono text-[9px] text-gray-600">
                   {formatTime(currentTime)} / {formatTime(duration)}
                 </span>
-                <div className="flex items-center gap-1">
-                  {SPEED_OPTIONS.map((r) => (
-                    <button
-                      key={r}
-                      onClick={() => applyRate(r)}
-                      className="font-mono text-[9px] px-1.5 py-0.5 rounded border transition-colors"
-                      style={{
-                        background: playbackRate === r ? 'rgba(0,255,136,0.08)' : 'transparent',
-                        borderColor: playbackRate === r ? '#00ff88' : '#374151',
-                        color: playbackRate === r ? '#00ff88' : '#6b7280',
-                      }}
-                    >
-                      ×{r}
-                    </button>
-                  ))}
-                </div>
+                <span className="font-mono text-[9px] px-1.5 py-0.5 rounded border border-gray-700 text-gray-500">
+                  ×1
+                </span>
               </div>
               <div className="mt-1 font-mono text-[9px] text-gray-600">
                 同步：{syncDebug.connected ? <span className="text-green-500">已連線</span> : <span className="text-red-500">未連線</span>}
@@ -2407,8 +2412,8 @@ export function ZoneConfigPage() {
 
             <div className="text-xs text-gray-600 pt-2 border-t border-gray-800">
               Z1/Z2/Z3 是固定的操作員約定，供 AirportSimPanel（機場地面模擬）判讀一台飛機「進入聯絡道 → 跑道頭等待 → 起飛」三個階段用；Z4 以後的區域一樣能框選、對應聯絡道，只是沒有特殊語意。
-              Z1/Z2/Z3 只會延長跑道警戒倒數（{(RUNWAY_ALERT_DURATION_MS / 1000 / playbackRate).toFixed(1)} 秒，依目前 ×{playbackRate} 播放速度等比例縮短），不會自行發出入侵警告；只有跨越跑道入侵線、且通過上方「canIssueIncursionAlert」Gate（系統 RUNNING、監控啟用、跑道已警戒）才會真的發出警告與寫入正式紀錄。
-              系統未啟動或跑道未警戒時不會自動開機/自動警戒——需操作員自行啟動系統、開啟跑道保護。
+              Z1 觸發時會自動把跑道撥入警戒（保護）狀態並啟動跑道警戒倒數（{(RUNWAY_ALERT_DURATION_MS / 1000 / playbackRate).toFixed(1)} 秒，依目前 ×{playbackRate} 播放速度等比例縮短）；Z2/Z3 只能延長已經在跑的倒數，不能無中生有啟動警戒或建立倒數。三者都不會自行發出入侵警告；只有跨越跑道入侵線、且通過上方「canIssueIncursionAlert」Gate（系統 RUNNING、監控啟用、跑道已警戒）才會真的發出警告與寫入正式紀錄。
+              系統（STM）不會自動開機——需操作員自行啟動；系統已啟動後，跑道保護可由 Z1 自動開啟，也可由操作員手動開啟。
               最後更新：{config.updated_at} · 修改後記得按「儲存」。
             </div>
           </div>

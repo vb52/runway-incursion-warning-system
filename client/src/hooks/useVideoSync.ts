@@ -23,6 +23,22 @@ export interface VideoSyncDebug {
 const DRIFT_CORRECTION_THRESHOLD_S = 0.15; // only hard-seek past this, so small jitter doesn't stutter playback
 const RECHECK_INTERVAL_MS = 1000;
 
+// Module-level (not per-hook-instance) since ZoneConfig.tsx's own
+// handleVideoSeeking needs to read this from the SAME <video> this hook is
+// driving, regardless of render timing — see its comment below for why this
+// exists. Date.now() ms of the last time THIS hook programmatically set
+// v.currentTime (a drift correction, not a user action).
+let lastProgrammaticSeekAt = 0;
+
+// How large a programmatic drift-correction jump can plausibly be and still
+// legitimately be "just us resyncing" rather than something else — no cap in
+// practice (a correction after a long buffering stall can be arbitrarily
+// large), so this isn't a size check; see handleVideoSeeking's use of
+// getLastProgrammaticSeekAt() for the actual timing-window check.
+export function getLastProgrammaticSeekAt(): number {
+  return lastProgrammaticSeekAt;
+}
+
 export function useVideoSync(videoRef: RefObject<HTMLVideoElement>) {
   const stateRef = useRef<VideoSyncState | null>(null);
   const [debug, setDebug] = useState<VideoSyncDebug>({ connected: false, lastSyncAt: null, driftS: 0 });
@@ -44,6 +60,17 @@ export function useVideoSync(videoRef: RefObject<HTMLVideoElement>) {
           const expected = (((s.epochPosition + elapsed) % duration) + duration) % duration;
           driftS = v.currentTime - expected;
           if (Math.abs(driftS) > DRIFT_CORRECTION_THRESHOLD_S) {
+            // Tagged with a timestamp (not a plain boolean — the native
+            // 'seeking' event this triggers dispatches asynchronously, so a
+            // synchronous "set true, assign, set false" flag could clear
+            // before the listener ever reads it) so
+            // ZoneConfig.tsx's handleVideoSeeking can recognize "this seek
+            // was OUR OWN resync, not the operator dragging the bar" even
+            // when the jump is large (e.g. after a long initial-buffering
+            // stall, drift can exceed several seconds) — see that function's
+            // comment for why misclassifying this as a real seek was wiping
+            // in-flight aircraft events/vehicles.
+            lastProgrammaticSeekAt = Date.now();
             v.currentTime = expected;
           }
         }

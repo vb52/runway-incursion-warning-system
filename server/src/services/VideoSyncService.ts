@@ -13,7 +13,10 @@ export interface VideoSyncState {
 }
 
 class VideoSyncService {
-  private state: VideoSyncState = { playbackRate: 3, epochPosition: 0, epochTime: Date.now() };
+  // Playback speed fixed at 1x — operator request: 影片播放速度訂死在正常，
+  // 不要加快. See socketHandlers.ts's 'video:update' handler, which also
+  // pins any incoming rate back to 1 regardless of what a client sends.
+  private state: VideoSyncState = { playbackRate: 1, epochPosition: 0, epochTime: Date.now() };
   private io: SocketIOServer | null = null;
 
   setSocketIO(io: SocketIOServer): void {

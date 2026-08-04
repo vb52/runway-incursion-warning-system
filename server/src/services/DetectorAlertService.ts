@@ -90,20 +90,22 @@ class DetectorAlertService {
 
   // Arms (or extends, if already armed) the alert window for durationMs.
   //
-  // Does NOT auto-start STM or auto-enable RWY protection — an operator must
-  // already have both running before any detection source can create or
-  // extend an alert. A detection arriving while the system is off/runway
-  // unprotected is simply dropped: there is nothing "protected" for it to
-  // warn about yet, and silently powering the system on in reaction to a
-  // motion/AI hit is not something a detection should ever be able to do.
+  // Never auto-starts STM — an operator must already have the system RUNNING
+  // before any detection source can do anything at all (see the operator's
+  // canIssueIncursionAlert Gate spec: 系統尚未啟動...不得自動開機). But RWY
+  // protection is different: 跑道自動進入保護狀態 per the operator's spec — Z1
+  // (mayCreate=true, the highest-priority/only-ever-creates source) IS
+  // allowed to bring the runway INTO protection automatically when it isn't
+  // already ON, same as it's allowed to start a fresh alert window from
+  // nothing. Z2/Z3 (mayCreate=false, taxiway-tracking zones — see
+  // ZoneConfig.tsx's armRunwayAlert calls) may only ever EXTEND something
+  // already active (an already-armed window, on an already-protected
+  // runway) — they can no more arm RWY protection from nothing than they can
+  // create a fresh alert window from nothing.
   //
-  // mayCreate=false (ZoneConfig.tsx's Z1/Z2/Z3 taxiway-tracking motion-zone
-  // hits) means this call may only EXTEND an alert that's already active; it
-  // must never start a fresh one on its own. Checked here (server-owned
-  // alertUntil is the single source of truth) rather than against the
-  // client's own local copy, which can lag a socket round-trip behind. Only
-  // the 跑道入侵線 (mayCreate left at its default true) may ever transition
-  // alertUntil from null -> armed.
+  // mayCreate is checked here (server-owned alertUntil/runwayProtectionState
+  // are the single source of truth) rather than against the client's own
+  // local copy, which can lag a socket round-trip behind.
   async arm(durationMs: number, mayCreate = true): Promise<void> {
     if (this.suppressUntil !== null) {
       if (Date.now() < this.suppressUntil) return;
@@ -111,7 +113,22 @@ class DetectorAlertService {
     }
 
     if (systemStateService.getPowerState() !== 'ACTIVE') return;
-    if (systemStateService.getRunwayProtectionState() !== 'ON') return;
+
+    if (systemStateService.getRunwayProtectionState() !== 'ON') {
+      if (!mayCreate) return; // Z2/Z3 alone may never arm protection from nothing
+      const previousState = systemStateService.getRunwayProtectionState();
+      const result = systemStateService.enableRunwayProtection();
+      auditService.logAction({
+        action_type: 'RUNWAY_ENABLE',
+        target_type: 'RUNWAY',
+        operator_name: OPERATOR_NAME,
+        previous_state: previousState,
+        new_state: result.success ? 'ON' : previousState,
+        result: result.success ? 'SUCCESS' : 'FAILED',
+        metadata: result.error ? { error: result.error } : undefined,
+      });
+      if (!result.success) return; // couldn't arm protection — nothing more to do
+    }
 
     if (!mayCreate && this.alertUntil === null) return;
 
