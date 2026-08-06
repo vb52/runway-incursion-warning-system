@@ -171,23 +171,25 @@ interface TaxiwayRuntimeState {
   // Date.now() ms until which NO LOCAL_AI incursion may latch for this
   // taxiway, for ANY eventId — not just the one that was just cleared.
   // Set by clearIncursionLatch (manual 復歸 — see its comment): the operator
-  // requirement is "手動按掉警報為最高優先級，復歸後30秒不再響警報" (dismissing
-  // is the highest-priority action; the alarm stays quiet for 30s after,
-  // full stop). suppressedEventId alone only protects against the SAME
-  // lingering eventId re-latching forever; this additionally blocks even a
-  // genuinely different-looking new eventId for the 30s window, matching
-  // the same grace period DetectorAlertService.suppress() opens server-side
-  // (see taxiwayRoutes.ts's /reset). After the window closes, the ordinary
+  // requirement is "警報復歸的優先級最高，按掉後20秒內不再發警告" (dismissing is
+  // the highest-priority action; the alarm stays quiet for 20s after, full
+  // stop). suppressedEventId alone only protects against the SAME lingering
+  // eventId re-latching forever; this additionally blocks even a genuinely
+  // different-looking new eventId for the whole window, matching the grace
+  // period DetectorAlertService.acknowledgeReset() opens server-side (see
+  // taxiwayRoutes.ts's /reset). After the window closes, the ordinary
   // suppressedEventId/new-eventId rules apply as normal.
   manualSuppressUntil: number;
 }
 
-// Operator requirement: 復歸後30秒不再響警報 — kept in lockstep with
-// DetectorAlertService's own SUPPRESS_BASE_MS on the server (see
-// taxiwayRoutes.ts's /reset), though the two are independent mechanisms
-// (this one covers the LOCAL_AI popup/sound path; the server's covers arm()/
-// backend detection).
-const MANUAL_ALERT_SUPPRESS_MS = 30000;
+// Operator requirement: 警報復歸的優先級最高（等於人員手動操作的優先級最高），
+// 按掉後20秒內不再發警告 — kept in lockstep with DetectorAlertService's
+// RESET_SUPPRESS_MS on the server (see taxiwayRoutes.ts's /reset), though the
+// two are independent mechanisms covering different halves of "a warning":
+// this one is the LOCAL_AI popup/sound the operator actually sees and hears,
+// the server's is arm()/backend detection. They have to move together or a
+// 復歸 goes quiet on one path while the other is still free to fire.
+const MANUAL_ALERT_SUPPRESS_MS = 20000;
 
 type Listener = () => void;
 
@@ -315,7 +317,7 @@ export function clearIncursionLatch(taxiwayId: TaxiwayId): void {
   // camera hasn't actually stopped seeing the aircraft) doesn't immediately
   // re-latch it — see the suppressedEventId field's comment.
   state.suppressedEventId = state.snapshot?.eventId ?? null;
-  // 手動按掉警報為最高優先級，復歸後30秒不再響警報 — see manualSuppressUntil's
+  // 警報復歸的優先級最高，按掉後20秒內不再發警告 — see manualSuppressUntil's
   // comment. Broader than suppressedEventId: blocks ANY LOCAL_AI incursion
   // for this taxiway (not just the one just cleared) for the full window.
   state.manualSuppressUntil = Date.now() + MANUAL_ALERT_SUPPRESS_MS;
@@ -410,7 +412,7 @@ export function applyRunwayStateUpdate(snapshot: AiDetectionSnapshot): void {
     effectiveIncursionLatched = false;
   }
 
-  // 手動按掉警報為最高優先級，復歸後30秒不再響警報 — broader than the eventId
+  // 警報復歸的優先級最高，按掉後20秒內不再發警告 — broader than the eventId
   // check above: blocks ANY LOCAL_AI incursion for this taxiway (even a
   // different-looking eventId) until the window closes. See
   // manualSuppressUntil's comment.

@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
 import { getSocket } from '../services/socketService';
 import { getDetectorVideoElement, onDetectorVideoElementChange } from '../services/detectorVideoRegistry';
+import { publishLocalSeek } from '../hooks/useVideoSync';
 
 // Loop preview of the detector's demo camera clip — mirrors ZoneConfig.tsx's
 // own <video> element via canvas instead of owning a second independent
@@ -125,7 +126,12 @@ export function VideoFeed({ className }: { className?: string }) {
     setCurrentTime(t);
     // Playback speed is fixed at 1x — always publish 1, never whatever the
     // element's own playbackRate happens to read (see the module doc).
-    getSocket().emit('video:update', { playbackRate: 1, currentTime: t });
+    // Goes through publishLocalSeek rather than emitting 'video:update'
+    // straight onto the socket: this bar is an <input type="range"> whose
+    // onChange fires once per drag increment, and emitting each one made the
+    // sync layer fight the drag (see publishLocalSeek's comment for what that
+    // did to detection).
+    publishLocalSeek(t, 1);
   };
 
   // Reloads the actual shared source (ZoneConfig.tsx's <video>) — fixes

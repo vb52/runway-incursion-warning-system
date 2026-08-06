@@ -1,7 +1,11 @@
 import React, { useEffect, useRef, useCallback, useState, forwardRef, useImperativeHandle } from 'react';
 import { RotateCcw } from 'lucide-react';
 import { TaxiwayState, TaxiwayId } from '../types';
-import { demoApi, taxiwayApi, detectorApi } from '../services/api';
+// No demoApi here on purpose: this panel is a *projection* of detections, it
+// never reports one. The only detection source is ZoneConfig.tsx's incursion
+// line (see its reportIncursionLineTrigger, which goes through the
+// canIssueIncursionAlert Gate).
+import { taxiwayApi, detectorApi } from '../services/api';
 import { useAppStore } from '../stores/appStore';
 import { getSocket } from '../services/socketService';
 import { useDetectorAlert } from '../hooks/useDetectorAlert';
@@ -85,7 +89,16 @@ const MIN_SPAWN_GAP_MS = 4000;
 // were only ever reachable from the removed DEMO mode).
 type VehiclePhase = 'TAXI_OUT' | 'TAXI_TO_HEAD' | 'AT_JUNCTION' | 'ENTER_RWY' | 'TAKEOFF_ROLL';
 
-type SimState = 'ACTIVE' | 'INCURSION' | 'DONE';
+// No 'INCURSION' member: this panel never decides on its own that a plane is
+// an incursion. It used to — sitting at an unauthorized (GUARDED) runway head
+// locally flagged INCURSION *and* fired a real POST /api/demo/detect — which
+// meant simply revoking a taxiway's authorization while a plane waited at the
+// threshold raised a full runway-incursion alarm without the 跑道入侵線 ever
+// being crossed, bypassing canIssueIncursionAlert entirely. Only the incursion
+// line may create an incursion now; the red ring on a taxiway's junction dot
+// still shows real backend INCURSION_LATCHED state (see renderFrame), which is
+// the authoritative signal.
+type SimState = 'ACTIVE' | 'DONE';
 
 interface SimVehicle {
   id: string;
@@ -100,7 +113,6 @@ interface SimVehicle {
   phase: VehiclePhase;
   progress: number;
   holdTimer: number;
-  incTriggered: boolean;
   simState: SimState;
   // Assigned once at spawn and kept for the vehicle's whole lifetime (see
   // randomVehicleColor) — lets an operator visually tell "same plane" from
@@ -168,7 +180,6 @@ function mkVehicle(t: Template): SimVehicle {
     phase: 'TAXI_OUT',
     progress: 0,
     holdTimer: 0,
-    incTriggered: false,
     simState: 'ACTIVE',
     color: randomVehicleColor(),
     catchUp: false,
@@ -265,11 +276,11 @@ function vehicleXY(v: SimVehicle): { x: number; y: number } {
   }
 }
 
+// Always the vehicle's own identity color now — this panel no longer has a
+// local "this plane is an incursion" state to override it with (see
+// SimState's comment). A real, backend-confirmed incursion shows on the
+// taxiway's junction dot instead (renderFrame's INCURSION_LATCHED ring).
 function vehicleColor(v: SimVehicle): string {
-  // INCURSION stays a hard-coded red regardless of identity color — that's
-  // an operational alarm signal, not a decoration, and has to stay
-  // universally recognizable the same way it does everywhere else in RIWS.
-  if (v.simState === 'INCURSION') return '#FF4444';
   return v.color;
 }
 
@@ -346,12 +357,17 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
   // Unique-id counter for spawned vehicles (id only, not related to
   // ZoneConfig.tsx's own eventId — see SimVehicle.id vs SimVehicle.eventId).
   const vehicleCounterRef = useRef(0);
-  // Up to two tracked vehicles per taxiway key (`${txIdx}${side}`) — see
-  // spawnAtTaxiway below and ZoneConfig.tsx's AircraftEventState comment for
-  // the concurrency-cap reasoning: one plane still in transit through
-  // stage 1/2 (TAXI_OUT/TAXI_TO_HEAD), plus one already ahead at/past the
-  // runway head (AT_JUNCTION or later). ENTERING only ever creates a new
-  // entry when there's no in-transit one already.
+  // Tracked vehicles per taxiway key (`${txIdx}${side}`) — UP TO TWO at a
+  // time: one already DEPARTING (ENTER_RWY/TAKEOFF_ROLL) plus one new
+  // arrival taxiing in behind it. Per the operator's rule — 如果有一架飛機在
+  // 起飛，Z1 又偵測到東西，那就是新的一架 — a takeoff roll is exactly what
+  // frees a taxiway to receive the next aircraft, and both are on the field
+  // at the same time, so both have to be drawn. A plane merely holding at
+  // the runway head (AT_JUNCTION) does NOT free it: nothing has left yet.
+  // See spawnAtTaxiway's ENTERING branch for how the cap is enforced (by
+  // PHASE, never by eventId — that's also what keeps cross-tab socket echo
+  // out) and ZoneConfig.tsx's AircraftEventState comment for the identical
+  // rule on the event-machine side.
   const detectorVehiclesRef = useRef<Map<string, SimVehicle[]>>(new Map());
   // Date.now() ms of the last NEW vehicle created, per taxiway key — see
   // MIN_SPAWN_GAP_MS / canSpawnNew in spawnAtTaxiway.
@@ -440,32 +456,45 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
         // scale can just be tuned by feel.
         h += `<path d="M0,-14 L2.1,0 L12.6,4.2 L1.4,4.2 L2.1,9.8 L5.6,12.6 L1.4,12.6 L0,14 L-1.4,12.6 L-5.6,12.6 L-2.1,9.8 L-1.4,4.2 L-12.6,4.2 L-2.1,0 Z" fill="${col}" opacity="0.9" transform="translate(${xs},${ys}) rotate(${vehicleRotation(v)}) scale(1.35)"/>`;
         h += `<text x="${(x + 8).toFixed(1)}" y="${(y + 4).toFixed(1)}" fill="${col}" font-size="8" font-family="monospace" opacity="0.65">${v.id}</text>`;
-        if (v.simState === 'INCURSION') {
-          h += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="13" fill="none" stroke="#FF4444" stroke-width="2" class="sim-ring"/>`;
-        }
+        // No per-vehicle incursion ring — see SimState's comment. The
+        // taxiway junction dots above still ring red on real, backend-
+        // confirmed INCURSION_LATCHED.
       }
       vLayer.innerHTML = h;
       setTrackCount(active);
 
       // Safety net, independent of ZoneConfig.tsx's own event-state gating
-      // actually working — counts vehicles currently mid-takeoff
-      // (ENTER_RWY/TAKEOFF_ROLL) per taxiway key. Should never exceed 2: up
-      // to two concurrent aircraft are legitimate per taxiway — a front
-      // plane can still be finishing TAKEOFF_ROLL while a second,
-      // independently-tracked back plane just started its own ENTER_RWY. A
-      // future regression that reintroduces uncapped duplicate spawning
-      // surfaces here immediately instead of silently shipping.
-      const takeoffCounts = new Map<string, number>();
+      // actually working — counts LIVE vehicles per taxiway key, split by
+      // whether they've started their takeoff roll yet. Two invariants, both
+      // enforced in spawnAtTaxiway's ENTERING branch:
+      //   • at most 2 on field at once — one departing, one arriving behind
+      //     it (see detectorVehiclesRef's comment)
+      //   • at most 1 of those NOT yet departing. A second still-arriving
+      //     plane is never a real second aircraft; it's a duplicate spawn.
+      //     The io.emit cross-tab echo is the path that actually produced
+      //     one — see that branch.
+      // Violating either surfaces here immediately instead of silently
+      // shipping.
+      const liveCounts = new Map<string, number>();
+      const arrivingCounts = new Map<string, number>();
       for (const v of vehiclesRef.current) {
         if (v.simState === 'DONE') continue;
-        if (v.phase !== 'ENTER_RWY' && v.phase !== 'TAKEOFF_ROLL') continue;
         const key = `${v.txIdx}${v.side}`;
-        takeoffCounts.set(key, (takeoffCounts.get(key) ?? 0) + 1);
+        liveCounts.set(key, (liveCounts.get(key) ?? 0) + 1);
+        if (phaseOrder(v.phase) < phaseOrder('ENTER_RWY')) {
+          arrivingCounts.set(key, (arrivingCounts.get(key) ?? 0) + 1);
+        }
       }
-      for (const [key, count] of takeoffCounts) {
+      for (const [key, count] of liveCounts) {
         if (count > 2) {
           // eslint-disable-next-line no-console
-          console.error(`Duplicate takeoff aircraft detected on taxiway ${key}: ${count} vehicles mid-takeoff simultaneously (max 2 expected).`);
+          console.error(`Duplicate aircraft detected on taxiway ${key}: ${count} vehicles on field simultaneously (max 2 expected).`);
+        }
+      }
+      for (const [key, count] of arrivingCounts) {
+        if (count > 1) {
+          // eslint-disable-next-line no-console
+          console.error(`Duplicate inbound aircraft on taxiway ${key}: ${count} vehicles arriving simultaneously (max 1 expected).`);
         }
       }
     }
@@ -507,32 +536,14 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
     for (const v of vehiclesRef.current) {
       if (v.simState === 'DONE') continue; // pruned from the array below
 
-      // Check if incursion was cleared by operator — clearing an incursion
-      // must NOT auto-authorize takeoff — only real Z3 evidence may (see
-      // spawnAtTaxiway's TAKEOFF branch) — so it just returns to normal
-      // AT_JUNCTION waiting, exactly as if the incursion had never happened.
-      // Without this, any plane that ever triggered a real incursion
-      // (taxiway GUARDED while it waited at the runway head — the ordinary
-      // case whenever RWY protection is armed and this taxiway isn't
-      // explicitly authorized) would take off the instant that incursion
-      // cleared (RESET, re-authorization, etc.) — with no Z3 motion involved
-      // at all. This was "沒等 Z3 就起飛了" reported live. Incursion can only
-      // ever be flagged below while a vehicle is frozen at AT_JUNCTION (see
-      // that case), so there is structurally nothing else to interrupt —
-      // the entering-runway-head animation (TAXI_TO_HEAD) can never be
-      // mid-flight when an incursion fires, keeping the alarm system and
-      // this animation state machine fully decoupled.
-      if (v.simState === 'INCURSION' && v.phase === 'AT_JUNCTION') {
-        const twId = `${v.txIdx + 1}${v.side}` as TaxiwayId;
-        if (getTwState(twId) !== 'INCURSION_LATCHED') {
-          v.simState = 'ACTIVE';
-          v.incTriggered = false;
-          // Stays at AT_JUNCTION. If takeoffPending was already set (Z3
-          // confirmed while the incursion was active), the normal
-          // AT_JUNCTION case below picks it up on the very next tick.
-        }
-        continue;
-      }
+      // (An "incursion was cleared by the operator, return this vehicle to
+      // normal waiting" branch used to live here. It's gone along with the
+      // local INCURSION state itself — see SimState's comment. Without a
+      // local incursion state there is nothing to clear, and critically
+      // nothing here reads taxiway authorization at all anymore, so an
+      // authorize/revoke/reset can no longer perturb the animation state
+      // machine in either direction. Only real Z3 evidence moves a plane off
+      // AT_JUNCTION, which is what "沒等 Z3 就起飛了" required.)
 
       // CATCH_UP_MULTIPLIER only ever boosts TAXI_OUT/TAXI_TO_HEAD progress
       // (see below) — those are the two phases where "Z3 fired before this
@@ -621,39 +632,30 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
             // still mid-taxi (see spawnAtTaxiway's TAKEOFF branch) — it just
             // caught up to the junction under catchUp, and now carries
             // straight through to ENTER_RWY the same way the "already at
-            // the junction when TAKEOFF confirmed" case does below. This is
-            // stronger evidence than the simulated authorization gate, so it
-            // overrides GUARDED here too, same as that other case always has.
+            // the junction when TAKEOFF confirmed" case does below. Real Z3
+            // evidence is the only thing that may do this, and it does so
+            // regardless of the taxiway's authorization state.
             v.phase = 'ENTER_RWY';
             v.progress = 0;
-            v.simState = 'ACTIVE';
-            v.incTriggered = false;
             v.catchUp = true;
             v.takeoffPending = false;
             break;
           }
-          const twId = `${v.txIdx + 1}${v.side}` as TaxiwayId;
-          const tw = getTwState(twId);
-          if (tw === 'GUARDED' && !v.incTriggered) {
-            v.incTriggered = true; v.simState = 'INCURSION';
-            // Call real detection API — backend handles latching + event +
-            // audit. Independent of the animation state machine — see the
-            // INCURSION-cleared handling above for why the two stay
-            // decoupled.
-            demoApi.detect({
-              taxiway_id: twId,
-              target_id: v.id,
-              target_type: 'AIRCRAFT',
-              confidence: 0.94,
-              entering_runway: true,
-            }).catch(() => {/* toast shown by socket */});
-          }
-          // Authorized (or RWY protection off) just keeps waiting here —
-          // real Z3 zone evidence (spawnAtTaxiway's TAKEOFF branch, via
-          // takeoffPending above) is what actually confirms a real plane
-          // took off, never the simulated authorization state by itself.
-          // Otherwise the sim would show a takeoff whenever the runway
-          // happens to be authorized, even if Z3 never actually fired.
+          // Otherwise: just keep waiting at the runway head, indefinitely,
+          // whatever the taxiway's authorization state is. This deliberately
+          // does NOT inspect getTwState anymore — it used to fire a real
+          // POST /api/demo/detect the moment it saw GUARDED, so revoking a
+          // taxiway's authorization while a plane sat here raised a runway-
+          // incursion alarm even though the 跑道入侵線 was never crossed (and
+          // bypassed canIssueIncursionAlert, since it called the detect API
+          // directly rather than going through ZoneConfig.tsx's gated
+          // paths). Only the incursion line may report an incursion now.
+          //
+          // Nothing but real Z3 zone evidence (spawnAtTaxiway's TAKEOFF
+          // branch, via takeoffPending above) ever moves a plane off this
+          // phase — never the authorization state by itself, or the sim
+          // would show a takeoff whenever the runway happens to be
+          // authorized even if Z3 never fired.
           break;
         }
 
@@ -781,10 +783,11 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
     const side = match[2] as 'N' | 'S';
     const key = `${txIdx}${side}`;
 
-    // Up to two vehicles may be tracked per taxiway — see
-    // detectorVehiclesRef's comment. onField filters out anything pruned
-    // from vehiclesRef (DONE) or otherwise stale, and is the "current truth"
-    // every branch below reads and writes back through.
+    // Up to two vehicles are tracked per taxiway — see detectorVehiclesRef's
+    // comment. onField filters out anything pruned from vehiclesRef (DONE)
+    // or otherwise stale, and is the "current truth" every branch below
+    // reads and writes back through — including the ENTERING branch's cap,
+    // which is expressed purely in terms of what's on it.
     const trackedAll = detectorVehiclesRef.current.get(key) ?? [];
     const onField = trackedAll.filter((v) => vehiclesRef.current.includes(v) && v.simState !== 'DONE');
     // Debounces NEW-vehicle creation per taxiway — see MIN_SPAWN_GAP_MS.
@@ -800,25 +803,31 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
 
     if (event === 'TAKEOFF') {
       // Stage 3 (起飛) — never spawns. Targets the event's own vehicle by
-      // eventId; falls back to whichever onField vehicle is FURTHEST along
-      // (phaseOrder) if not matched — with up to two tracked, that's always
-      // the one ahead/at the runway head, never a newer one still in
-      // transit through stage 1/2 (a different plane's event). If nothing's
-      // tracked (untracked — e.g.
-      // LIVE was off earlier in this aircraft's event, or it already
-      // departed), this is simply dropped.
+      // eventId, since that identifies the aircraft whose Z3 actually fired.
+      //
+      // The fallback (id matched nothing — with the io.emit broadcast, a
+      // TAKEOFF can carry ANOTHER tab's eventId for the same physical
+      // aircraft; see the ENTERING branch) takes the FURTHEST-ALONG vehicle
+      // on field, but only if it hasn't already started its roll. If the
+      // furthest along is ALREADY in TAKEOFF_ROLL, this command is a
+      // duplicate for a plane that's demonstrably already departing, so it's
+      // dropped — it must never fall through to the newer aircraft queued
+      // behind it. 新的 EVENT 飛機也要遵守 Z3 觸發才能起飛: a new arrival is
+      // launched only by a TAKEOFF carrying its OWN eventId, i.e. by its own
+      // Z3. (Computing "furthest" across ALL of onField and then testing it
+      // is what makes that hold — filtering the already-rolling one out
+      // FIRST is what used to leave the new arrival as the only candidate.)
+      // If nothing's tracked at all (LIVE was off earlier in this aircraft's
+      // event, or it already departed), this is dropped too.
+      const furthest = [...onField].sort((a, b) => phaseOrder(b.phase) - phaseOrder(a.phase))[0];
       const veh = onField.find((v) => v.eventId === eventId)
-        ?? onField
-          .filter((v) => phaseOrder(v.phase) < phaseOrder('TAKEOFF_ROLL'))
-          .sort((a, b) => phaseOrder(b.phase) - phaseOrder(a.phase))[0];
+        ?? (furthest && phaseOrder(furthest.phase) < phaseOrder('TAKEOFF_ROLL') ? furthest : undefined);
       if (veh) {
         if (veh.phase === 'AT_JUNCTION') {
           // Already essentially at the threshold — a small, reasonable skip
           // straight onto the runway, same as always.
           veh.phase = 'ENTER_RWY';
           veh.progress = 0;
-          veh.simState = 'ACTIVE';
-          veh.incTriggered = false;
         } else if (veh.phase === 'TAXI_TO_HEAD' || veh.phase === 'TAXI_OUT') {
           // Still mid stage-1/stage-2 — do NOT teleport it straight onto the
           // runway from wherever it currently is; that reads as
@@ -833,22 +842,28 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
           veh.takeoffPending = true;
         }
         veh.catchUp = true;
-        // Departing — no longer tracked, but the OTHER vehicle (if any,
-        // still in transit through stage 1/2 as a separate plane) stays
-        // tracked.
-        const remaining = onField.filter((v) => v !== veh);
-        if (remaining.length > 0) detectorVehiclesRef.current.set(key, remaining);
-        else detectorVehiclesRef.current.delete(key);
+        // Deliberately stays TRACKED while it departs, rather than being
+        // dropped from detectorVehiclesRef the instant Z3 fires. A plane
+        // still visibly rolling/climbing is still ON the field and still
+        // holds one of this taxiway's two slots — untracking it here would
+        // let a third aircraft appear while only two are ever legitimate.
+        // It does not BLOCK the one arriving behind it either: the ENTERING
+        // cap keys off phase (this one is now past ENTER_RWY), not off "is
+        // anything tracked". onField's own `simState !== 'DONE'` filter
+        // releases the slot at the right moment: when the takeoff animation
+        // actually finishes (see simStep's TAKEOFF_ROLL case, which also
+        // emits 'sim:aircraft-departed' so ZoneConfig.tsx clears its
+        // matching event at the same time).
       }
     } else if (event === 'RUNWAY_HOLDING') {
       // Stage 2 (聯絡道進跑道頭) — never spawns, only advances the event's
       // own vehicle (matched by eventId, falling back to whichever onField
-      // vehicle is still in transit); the "ahead" one (AT_JUNCTION or
-      // later), if any, is a different plane's event and unaffected. If
-      // nothing's in transit, this is dropped rather than spawning a fresh
-      // vehicle straight at the junction (that used to be possible and is
-      // exactly what let a plane's first-ever appearance skip the taxi run
-      // entirely — see spawnAtTaxiway's header comment).
+      // vehicle is still in transit — same cross-tab-eventId reasoning as
+      // the TAKEOFF branch above). If nothing's in transit, this is dropped
+      // rather than spawning a fresh vehicle straight at the junction (that
+      // used to be possible and is exactly what let a plane's first-ever
+      // appearance skip the taxi run entirely — see spawnAtTaxiway's header
+      // comment).
       const tracked = onField.find((v) => v.eventId === eventId)
         ?? onField.find((v) => v.phase === 'TAXI_OUT' || v.phase === 'TAXI_TO_HEAD');
       if (tracked && (tracked.phase === 'TAXI_OUT' || tracked.phase === 'TAXI_TO_HEAD')) {
@@ -864,10 +879,30 @@ export const AirportSimPanel = forwardRef<AirportSimPanelHandle, Props>(function
     } else if (event === 'ENTERING') {
       // Stage 1 (進入聯絡道) — the ONLY event that may create a new vehicle,
       // mirroring ZoneConfig.tsx's rule that Z1 is the only thing that may
-      // create an AircraftEvent. Creates one only if this exact event id
-      // isn't already tracked (defense-in-depth — see the header comment).
-      const alreadyExists = onField.some((v) => v.eventId === eventId);
-      if (!alreadyExists && canSpawnNew()) {
+      // create an AircraftEvent.
+      //
+      // The cap is expressed by PHASE, never by eventId, and that is the
+      // whole point. The server relays 'sim:spawn-at-taxiway' with io.emit
+      // (broadcast to EVERY connected client) and every open tab runs its
+      // OWN ZoneConfig detection loop with its own independent
+      // eventIdCounter — so with two tabs open this panel receives two
+      // ENTERING commands carrying DIFFERENT eventIds for what is really the
+      // same physical aircraft. A per-eventId check cannot see those as
+      // duplicates (that's what put a phantom second plane on the diagram);
+      // a phase check can, because the echo always lands while the first
+      // vehicle is still sitting in TAXI_OUT at ENTERING_SPAWN_PROGRESS.
+      //
+      // Blocked while either:
+      //   • anything on this taxiway hasn't started its takeoff roll yet
+      //     (TAXI_OUT/TAXI_TO_HEAD/AT_JUNCTION). 如果有一架飛機在起飛，Z1 又
+      //     偵測到東西，那才是新的一架 — nothing has vacated the taxiway until
+      //     a plane is actually rolling, so a Z1 hit before that is either
+      //     the same plane's own signal or the cross-tab echo above;
+      //   • two are already on field — the legitimate maximum (one
+      //     departing, one arriving; see detectorVehiclesRef's comment).
+      const blocked = onField.some((v) => phaseOrder(v.phase) < phaseOrder('ENTER_RWY'))
+        || onField.length >= 2;
+      if (!blocked && canSpawnNew()) {
         const v = mkVehicle({ id: `V${++vehicleCounterRef.current}`, eventId, side, txIdx });
         v.progress = ENTERING_SPAWN_PROGRESS;
         vehiclesRef.current.push(v);

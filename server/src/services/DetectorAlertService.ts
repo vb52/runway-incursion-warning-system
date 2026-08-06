@@ -36,6 +36,21 @@ const OPERATOR_NAME = 'AI-DETECTOR';
 // crossing takes less wall-clock time too.
 const SUPPRESS_BASE_MS = 30000;
 
+// Manual 復歸's own, shorter grace window — 警報復歸的優先級最高（等同人員手動
+// 操作的優先級最高），按掉後20秒內不再發警告. Deliberately its own constant and
+// not SUPPRESS_BASE_MS: that one is the "operator asked for a clean scene"
+// window sized to how long a plane can realistically still be crossing frame,
+// whereas this is the operator saying "I've seen it, be quiet" about one
+// taxiway. The two are free to differ, and per the operator's spec they now
+// do.
+//
+// Consequence worth being explicit about, since it's the reason the other
+// constant is 30s: a plane can still be mid-crossing 20s after the 復歸, so
+// the SAME aircraft may re-alarm once this window closes. That's the
+// operator's call — a shorter window means a genuinely new hazard is never
+// silenced for longer than 20s either.
+const RESET_SUPPRESS_MS = 20000;
+
 export interface DetectorAlertState {
   alertUntil: number | null; // Date.now() ms, or null when idle
 }
@@ -44,7 +59,20 @@ class DetectorAlertService {
   private alertUntil: number | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private io: SocketIOServer | null = null;
+  // FULL suppression — blocks arm() AND the ground-sim spawn relay (see
+  // isSuppressed). For "give me a clean scene" actions.
   private suppressUntil: number | null = null;
+  // ALARM-ONLY suppression — blocks arm() but deliberately NOT the spawn
+  // relay, so the ground-sim animation keeps running normally. See
+  // suppressAlarmOnly.
+  private alarmSuppressUntil: number | null = null;
+  // durationMs of the most recent arm(), replayed by disarm's hold branch so
+  // a held alarm keeps counting in the same calibrated, playback-rate-scaled
+  // units the detection source asked for (see the client's
+  // RUNWAY_ALERT_DURATION_MS) instead of a second constant that could drift
+  // away from it. null only before the first arm() — nothing can be holding
+  // then, since a timer only exists once arm() has set this.
+  private lastDurationMs: number | null = null;
 
   setSocketIO(io: SocketIOServer): void {
     this.io = io;
@@ -54,7 +82,8 @@ class DetectorAlertService {
     return { alertUntil: this.alertUntil };
   }
 
-  // Opens (or extends) a grace window during which arm() is ignored — see
+  // Opens (or extends) a FULL grace window — arm() is ignored AND
+  // detector-triggered spawns are dropped (see isSuppressed) — see
   // SUPPRESS_BASE_MS above for why this needs to exist and why it's this
   // long. Public so operator-initiated "start clean" actions other than
   // clear() (currently just POST /api/system/start) can request the same
@@ -64,13 +93,59 @@ class DetectorAlertService {
     this.suppressUntil = Date.now() + SUPPRESS_BASE_MS / rate;
   }
 
-  // Also consulted by socketHandlers.ts before relaying 'sim:spawn-at-taxiway'
-  // (DetectorConfig.tsx's motion-zone -> AirportSimPanel bridge) — during the
-  // same grace window that blocks arm(), a detector-triggered spawn would
-  // otherwise call AirportSimPanel.spawnAtTaxiway(), which auto-starts the
-  // ground-sim loop (`if (!isRunningRef.current) startSim()`) the instant a
-  // spawn arrives — undoing an operator's RESET just as surely as an
-  // immediate RWY re-arm would, just via a different code path.
+  // Opens (or extends) an ALARM-ONLY grace window: arm() is ignored, but the
+  // ground-sim spawn relay is untouched, so aircraft keep appearing and
+  // animating normally.
+  //
+  // This is what a single taxiway's 復歸 needs (手動按掉警報為最高優先級 — the
+  // operator asked for quiet, not for a frozen ground-sim). It briefly used
+  // the full suppress() above, which silently blocked every aircraft spawn
+  // for the whole window after any 復歸 — reported live as "ICON 沒成功出來".
+  // Length is RESET_SUPPRESS_MS (20s), not SUPPRESS_BASE_MS — see that
+  // constant. Scaled by playback rate exactly like the other windows, since
+  // faster playback compresses a crossing in wall-clock time too.
+  suppressAlarmOnly(): void {
+    const rate = videoSyncService.getState().playbackRate || 1;
+    this.alarmSuppressUntil = Date.now() + RESET_SUPPRESS_MS / rate;
+  }
+
+  // What an operator's 復歸 actually invokes (taxiwayRoutes' /reset).
+  // 警報復歸的優先級最高，等於人員手動操作的優先級最高 — so unlike every
+  // detection-driven path this one both SILENCES the live alert window
+  // immediately and opens the 20s no-warning window, rather than waiting for
+  // the current countdown to run itself out.
+  //
+  // The silence is conditional on nothing else still being latched. A 復歸 on
+  // taxiway 1N is the operator saying they've handled 1N — it is not a
+  // statement about 3S, and 若警報沒復歸就一直警示 still governs any incursion
+  // they HAVEN'T acknowledged (see disarm's hold branch, which re-arms
+  // directly and so is deliberately unaffected by the suppression window
+  // opened here).
+  //
+  // Deliberately does NOT route through disarm()/clear(): those also
+  // force-disable RWY protection (turning every non-latched taxiway OFF) and
+  // write a RUNWAY_DISABLE audit entry — far too broad for one taxiway's
+  // reset button, and protection staying ON is the safe direction anyway.
+  acknowledgeReset(): void {
+    if (!systemStateService.hasAnyIncursion()) {
+      if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+      if (this.alertUntil !== null) {
+        this.alertUntil = null;
+        this.io?.emit('detector:alert-cleared', this.getState());
+      }
+    }
+    this.suppressAlarmOnly();
+  }
+
+  // Consulted by socketHandlers.ts before relaying 'sim:spawn-at-taxiway'
+  // (ZoneConfig.tsx's motion-zone -> AirportSimPanel bridge) — during a FULL
+  // grace window a detector-triggered spawn would otherwise call
+  // AirportSimPanel.spawnAtTaxiway(), which auto-starts the ground-sim loop
+  // (`if (!isRunningRef.current) startSim()`) the instant a spawn arrives —
+  // undoing an operator's RESET just as surely as an immediate RWY re-arm
+  // would, just via a different code path. Deliberately does NOT consider
+  // alarmSuppressUntil: that window is about silence, not about freezing the
+  // ground-sim.
   isSuppressed(): boolean {
     return this.suppressUntil !== null && Date.now() < this.suppressUntil;
   }
@@ -94,22 +169,35 @@ class DetectorAlertService {
   // before any detection source can do anything at all (see the operator's
   // canIssueIncursionAlert Gate spec: 系統尚未啟動...不得自動開機). But RWY
   // protection is different: 跑道自動進入保護狀態 per the operator's spec — Z1
-  // (mayCreate=true, the highest-priority/only-ever-creates source) IS
-  // allowed to bring the runway INTO protection automatically when it isn't
-  // already ON, same as it's allowed to start a fresh alert window from
-  // nothing. Z2/Z3 (mayCreate=false, taxiway-tracking zones — see
-  // ZoneConfig.tsx's armRunwayAlert calls) may only ever EXTEND something
-  // already active (an already-armed window, on an already-protected
-  // runway) — they can no more arm RWY protection from nothing than they can
-  // create a fresh alert window from nothing.
+  // (mayCreate=true, the only source allowed to act from a cold/unprotected
+  // state) can bring the runway INTO protection automatically when it isn't
+  // already ON. Z2/Z3 (mayCreate=false — see ZoneConfig.tsx's armRunwayAlert
+  // calls) may never do that themselves; if protection is currently OFF and
+  // only a Z2/Z3 hit arrives, this call is simply dropped.
+  //
+  // 跑道保護啟動後，Z1/Z2/Z3 任一個被觸發都自動延長警戒30秒 — once protection
+  // IS already on (whether this call itself just turned it on, or an
+  // operator/earlier Z1 already had), mayCreate no longer matters for the
+  // alert window itself: ANY of Z1/Z2/Z3 restarts/extends it to a fresh
+  // durationMs. The old "Z2/Z3 may only extend an alert that already has
+  // alertUntil set, never one that quietly expired" restriction is gone —
+  // a runway under active protection should never have a dead window where
+  // real zone activity fails to keep the countdown/RWY-armed indicator
+  // fresh just because Z1 didn't personally re-fire.
   //
   // mayCreate is checked here (server-owned alertUntil/runwayProtectionState
   // are the single source of truth) rather than against the client's own
   // local copy, which can lag a socket round-trip behind.
   async arm(durationMs: number, mayCreate = true): Promise<void> {
+    // Both grace windows silence arming; only the full one also blocks
+    // ground-sim spawns (see isSuppressed / suppressAlarmOnly).
     if (this.suppressUntil !== null) {
       if (Date.now() < this.suppressUntil) return;
       this.suppressUntil = null;
+    }
+    if (this.alarmSuppressUntil !== null) {
+      if (Date.now() < this.alarmSuppressUntil) return;
+      this.alarmSuppressUntil = null;
     }
 
     if (systemStateService.getPowerState() !== 'ACTIVE') return;
@@ -130,8 +218,9 @@ class DetectorAlertService {
       if (!result.success) return; // couldn't arm protection — nothing more to do
     }
 
-    if (!mayCreate && this.alertUntil === null) return;
-
+    // Protection is confirmed ON at this point (either already was, or was
+    // just enabled above) — any trigger may now (re)start the countdown.
+    this.lastDurationMs = durationMs;
     this.alertUntil = Date.now() + durationMs;
     this.io?.emit('detector:alert-armed', this.getState());
 
@@ -163,6 +252,35 @@ class DetectorAlertService {
 
   private disarm(reason: 'expired' | 'manual-clear', suppress = true): void {
     this.timer = null;
+
+    // 若警報沒復歸，就一直警示 — a natural expiry may NOT silence the alert
+    // while any taxiway is still INCURSION_LATCHED. The operator hasn't 復歸'd
+    // it, so the hazard is by definition still standing; letting the window
+    // quietly run out would drop LiveMonitor's and the detector page's 警戒中
+    // countdown while the incursion is unresolved, making a live alarm look
+    // like it had already been dealt with. Re-arms for another full window
+    // instead, indefinitely — the countdown visibly keeps running rather than
+    // freezing on a number or disappearing.
+    //
+    // ONLY 'expired' is held. A manual clear still clears immediately (手動按
+    // 掉警報為最高優先級), and 復歸 itself (taxiwayRoutes' /reset) drops the
+    // latch, so the first expiry after it sees hasAnyIncursion() === false and
+    // disarms normally — a held alarm can never outlive the incursion that
+    // justified it.
+    //
+    // Deliberately does NOT open any suppression window: holding the alarm
+    // must not block the ground-sim spawn relay (see isSuppressed and the
+    // "ICON 沒成功出來" note on suppressAlarmOnly) — 地面模擬圖不停 the whole
+    // time the alarm stands.
+    if (reason === 'expired' && this.lastDurationMs !== null && systemStateService.hasAnyIncursion()) {
+      const durationMs = this.lastDurationMs;
+      this.alertUntil = Date.now() + durationMs;
+      this.io?.emit('detector:alert-armed', this.getState());
+      this.timer = setTimeout(() => this.disarm('expired'), durationMs);
+      logger.debug(`[DETECTOR] Alert window HELD — ${systemStateService.getAnyLatchedTaxiway()} still INCURSION_LATCHED (awaiting 復歸)`);
+      return;
+    }
+
     this.alertUntil = null;
     this.io?.emit('detector:alert-cleared', this.getState());
 

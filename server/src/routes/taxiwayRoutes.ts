@@ -85,18 +85,21 @@ router.post('/:id/reset', (req: Request, res: Response) => {
   const previousState = systemStateService.getTaxiwayState(id);
   const result = systemStateService.resetTaxiway(id);
 
-  // Manual 復歸 is the highest-priority action — open the same 30s grace
-  // window DetectorConfig.tsx's own RESET/AirportSimPanel's panel-local
-  // RESET already use (see DetectorAlertService.suppress) so Z1/motion/AI/
-  // incursion-line detections can't immediately re-arm the runway alert the
-  // operator just dismissed. Deliberately calling suppress() alone here, NOT
-  // the full clear() — clear() also force-disables RWY protection (turning
-  // every non-latched taxiway OFF), which is far too broad a side effect for
-  // a single taxiway's reset button. Applied regardless of whether this call
-  // found a real INCURSION_LATCHED to clear or the taxiway had already
-  // resolved itself (alreadyCleared) — the operator's "I want quiet now"
-  // intent is the same either way.
-  detectorAlertService.suppress();
+  // 警報復歸的優先級最高，等於人員手動操作的優先級最高 — nothing a detection
+  // source reports outranks it. acknowledgeReset silences the live alert
+  // window on the spot (when this 復歸 leaves nothing else latched) and opens
+  // the 20s no-warning window so Z1/motion/AI/incursion-line detections can't
+  // immediately re-raise what the operator just dismissed. See that method
+  // for why it is alarm-only (a full suppression would also freeze the
+  // ground-sim spawn relay — "ICON 沒成功出來"), why it doesn't route through
+  // clear() (that would force-disable RWY protection for every taxiway), and
+  // why an incursion the operator has NOT acknowledged keeps alarming
+  // through this window.
+  //
+  // Applied regardless of whether this call found a real INCURSION_LATCHED to
+  // clear or the taxiway had already resolved itself (alreadyCleared) — the
+  // operator's intent is the same either way.
+  detectorAlertService.acknowledgeReset();
 
   // Idempotent no-op (taxiway was already not INCURSION_LATCHED) — nothing
   // changed, so this isn't audit-worthy and must not be reported as FAILED:

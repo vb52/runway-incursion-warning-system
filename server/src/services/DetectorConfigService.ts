@@ -18,6 +18,13 @@ const DEFAULT_CONFIG: Omit<DetectorConfig, 'updated_at'> = {
   masks: [],
   video_trigger_taxiway_id: '1S',
   video_trigger_seconds: [],
+  // 0 = "no reference frame recorded yet" — nothing has been drawn, or the
+  // stored zones predate the field. getConfig merges over these defaults, so
+  // older rows deserialize to 0 rather than undefined; ZoneConfig.tsx treats
+  // 0 as "can't check" and stays quiet instead of warning about a mismatch
+  // it has no baseline for.
+  motion_frame_w: 0,
+  motion_frame_h: 0,
   motion_zones: [],
   // Matches DetectorConfig.tsx's old DEFAULT_MOTION_THRESHOLD, now that the
   // value is persisted here instead of local React state.

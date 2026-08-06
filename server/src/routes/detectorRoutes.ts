@@ -61,6 +61,14 @@ function validateConfigBody(body: unknown): string | null {
       return 'motion_zones must be an array of {id, rect, taxiway_id}.';
     }
   }
+  // Optional and allowed to be 0 ("not recorded") — unlike frame_w/frame_h
+  // above, which must be positive. RIWS-POC's push_config() never sends
+  // these; only the web editor knows the browser video's intrinsic size.
+  for (const key of ['motion_frame_w', 'motion_frame_h'] as const) {
+    if (b[key] !== undefined && (typeof b[key] !== 'number' || (b[key] as number) < 0)) {
+      return `${key} must be a non-negative number.`;
+    }
+  }
   if (b.motion_threshold !== undefined) {
     if (typeof b.motion_threshold !== 'number' || b.motion_threshold < 0 || b.motion_threshold > 1) {
       return 'motion_threshold must be a number between 0 and 1.';
@@ -106,6 +114,8 @@ router.put('/config', (req: Request, res: Response) => {
     video_trigger_seconds: Array.isArray(req.body.video_trigger_seconds)
       ? req.body.video_trigger_seconds
       : current.video_trigger_seconds,
+    motion_frame_w: typeof req.body.motion_frame_w === 'number' ? req.body.motion_frame_w : current.motion_frame_w,
+    motion_frame_h: typeof req.body.motion_frame_h === 'number' ? req.body.motion_frame_h : current.motion_frame_h,
     motion_zones: Array.isArray(req.body.motion_zones) ? req.body.motion_zones : current.motion_zones,
     motion_threshold: typeof req.body.motion_threshold === 'number' ? req.body.motion_threshold : current.motion_threshold,
     incursion_line: req.body.incursion_line !== undefined ? req.body.incursion_line : current.incursion_line,

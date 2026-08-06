@@ -233,6 +233,29 @@ class SystemStateService {
       return { success: false, error: 'System must be ACTIVE.' };
     }
 
+    // A RUNWAY INCURSION is by definition an incursion onto a PROTECTED
+    // runway, so protection is forced on here when it isn't already. It
+    // genuinely can be off at this moment: the alert window expiring runs
+    // disableRunwayProtection() (which succeeds while nothing is latched
+    // yet), and the 跑道入侵線 can fire after that — latchIncursion itself
+    // never checked, so the runway ended up "unprotected but incurred".
+    //
+    // The visible symptom was on 復歸, not here: resetTaxiway returns a
+    // cleared taxiway to GUARDED only when protection is ON, and to OFF
+    // otherwise — so 按下 1S 復歸 turned it grey instead of 變回黃色跑道保護.
+    // Fixing it at the latch keeps resetTaxiway's rule intact (GUARDED means
+    // "under runway protection", and now it truthfully is) instead of
+    // special-casing the reset to paint yellow over an unprotected runway.
+    //
+    // Ordering matters: enableRunwayProtection moves every OFF taxiway to
+    // GUARDED, so it has to run BEFORE this one is set to INCURSION_LATCHED.
+    // Same 跑道自動進入保護狀態 rule DetectorAlertService.arm() already
+    // applies for a Z1 hit — an incursion is strictly stronger evidence.
+    if (this.runwayProtectionState !== 'ON') {
+      logger.warn(`[TAXIWAY] Incursion on ${id} with RWY protection OFF — auto-enabling protection first.`);
+      this.enableRunwayProtection();
+    }
+
     logger.warn(`[TAXIWAY] INCURSION LATCHED on ${id}!`);
     this.taxiways.set(id, 'INCURSION_LATCHED');
     this.updatedAt = nowIso();

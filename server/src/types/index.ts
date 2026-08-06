@@ -260,8 +260,31 @@ export interface DetectorConfig {
   // seconds into the loop) for when neither automatic method catches it.
   video_trigger_taxiway_id: string;
   video_trigger_seconds: number[];
-  // Operator-drawn motion-detection zones (pixel rects in frame_w x frame_h
-  // space, same as zones/masks) — replaces the old single motion_region.
+  // Intrinsic pixel size of the detector video that motion_zones and
+  // incursion_line were actually drawn against (ZoneConfig.tsx sizes its
+  // drawing canvas to video.videoWidth/videoHeight, so that — NOT
+  // frame_w/frame_h — is the space their rects live in). 0 = never recorded,
+  // i.e. zones saved before this field existed.
+  //
+  // frame_w/frame_h cannot serve this purpose: those describe zones/masks,
+  // RIWS-POC's YOLO regions, and are overwritten by the Python detector's
+  // push_config() with ITS stream resolution — a completely independent
+  // pipeline that knows nothing about the browser's demo clip. The two
+  // genuinely disagree in practice (1280x720 stored while motion zones sit
+  // at y≈800), which is correct, not a bug — they are different frames.
+  //
+  // Recorded so swapping the demo clip for one of a different resolution is
+  // DETECTABLE. Without it, every motion zone and the incursion line would
+  // silently point at the wrong pixels: a safety trigger quietly aiming
+  // somewhere else, with nothing to compare against and no error anywhere.
+  // ZoneConfig.tsx warns the operator on mismatch rather than auto-rescaling
+  // — moving a runway-incursion trigger without being told is worse than
+  // being told it needs redrawing.
+  motion_frame_w: number;
+  motion_frame_h: number;
+  // Operator-drawn motion-detection zones (pixel rects in
+  // motion_frame_w x motion_frame_h space — see above; NOT frame_w/frame_h,
+  // which belongs to zones/masks) — replaces the old single motion_region.
   // Each zone is independently frame-diffed and maps to its own taxiway, so
   // e.g. Z1 over one taxiway mouth and Z2 over another each report to the
   // right POST /api/demo/detect target instead of everything funneling

@@ -73,14 +73,28 @@ class SimulationEngine {
     let severity: EventSeverity;
     let authorizationState: string;
 
-    if (taxiwayState === 'INCURSION_LATCHED') {
-      // Already latched - add dedup timeline
-      return {
-        success: true,
-        message: `聯絡道 ${detection.taxiwayId} 已處於入侵鎖定狀態。`,
-      };
-    }
-
+    // NOT short-circuited when the taxiway is already INCURSION_LATCHED.
+    //
+    // 一條聯絡道被鎖定，指的是「這架飛機的入侵還沒被復歸」，不是「這條聯絡道
+    // 之後發生什麼都不用記錄」. A second aircraft entering the same taxiway
+    // while the first incursion is still un-復歸'd is a SECOND hazard and
+    // gets its own event, its own截圖 and its own VLM analysis — an operator
+    // reviewing the incident must be able to see that two aircraft were
+    // involved, not one.
+    //
+    // This used to `return` here. Because the latch survives until an
+    // explicit 復歸, that silently discarded every detection in between —
+    // no event, no media, and (unlike the dedup path below) not even a
+    // timeline row, so nothing recorded that a detection had happened at
+    // all. The alarm still sounded client-side, which is how it showed up:
+    // 警報有響、事件沒建立.
+    //
+    // Dedup for the SAME aircraft is not lost by falling through —
+    // eventService.createEvent already collapses a repeat detection of the
+    // same target_id + taxiway_id + event_type onto the existing open event
+    // (returning isNew:false, handled below). That check is the right place
+    // for it: it keys off the aircraft's identity, whereas this branch could
+    // only ever key off the taxiway.
     if (detection.enteringRunway) {
       if (taxiwayState === 'AUTHORIZED') {
         // Authorized entry
@@ -153,10 +167,26 @@ class SimulationEngine {
       });
     }
 
-    // Generate media for RED and YELLOW events
-    if (severity === 'RED' || severity === 'YELLOW') {
+    // Generate media for RED and YELLOW events — and for ANY event that
+    // arrived with a real camera frame attached.
+    //
+    // hasRealSnapshot is part of the condition, not just of the body, because
+    // a severity-only gate threw away evidence the client had already
+    // captured and uploaded: 跑道入侵線 grabs the frame and POSTs it on every
+    // crossing (see ZoneConfig.tsx's captureSnapshot), but if the taxiway
+    // happened to be AUTHORIZED at that moment the event is INFO
+    // (AUTHORIZED_ENTRY) and this whole block was skipped — the JPEG was
+    // silently dropped and the event ended up with no media at all. A real
+    // photograph of an aircraft entering the runway is worth keeping
+    // regardless of how the authorization check classified it; that
+    // classification can be wrong or change, the frame can't be re-taken.
+    //
+    // An INFO event with NO snapshot still gets nothing, exactly as before —
+    // this is about not discarding real evidence, not about generating
+    // placeholder art for routine authorized movements.
+    const hasRealSnapshot = typeof detection.snapshotBase64 === 'string' && detection.snapshotBase64.length > 0;
+    if (severity === 'RED' || severity === 'YELLOW' || hasRealSnapshot) {
       try {
-        const hasRealSnapshot = typeof detection.snapshotBase64 === 'string' && detection.snapshotBase64.length > 0;
         const mediaRecords = mediaGeneratorService.generateEventMedia(event, { skipDetectionImage: hasRealSnapshot });
         if (hasRealSnapshot) {
           try {

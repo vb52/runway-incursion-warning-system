@@ -190,8 +190,23 @@ export interface DetectorConfig {
   // (video_trigger_seconds, seconds into the loop).
   video_trigger_taxiway_id: string;
   video_trigger_seconds: number[];
-  // Operator-drawn motion-detection zones (pixel rects in frame_w x frame_h
-  // space, same as zones/masks). Each zone is independently frame-diffed and
+  // Intrinsic pixel size of the detector video that motion_zones and
+  // incursion_line were drawn against — ZoneConfig.tsx sizes its drawing
+  // canvas to video.videoWidth/videoHeight (see ensureRegionCanvasSized), so
+  // that is the space their rects live in, NOT frame_w/frame_h. Those belong
+  // to zones/masks (RIWS-POC's YOLO regions) and are overwritten by the
+  // Python detector with its own stream resolution, so the two legitimately
+  // differ. 0 = never recorded.
+  //
+  // Exists so swapping the demo clip for a different resolution is
+  // detectable instead of silently re-aiming every zone and the incursion
+  // line at the wrong pixels. Mismatch is surfaced as a warning on this
+  // page; nothing is auto-rescaled.
+  motion_frame_w: number;
+  motion_frame_h: number;
+  // Operator-drawn motion-detection zones (pixel rects in
+  // motion_frame_w x motion_frame_h space — see above). Each zone is
+  // independently frame-diffed and
   // maps to its own taxiway, so e.g. Z1 over one taxiway mouth and Z2 over
   // another each report to the right taxiway instead of everything funneling
   // through one shared video_trigger_taxiway_id. Empty array = no motion
