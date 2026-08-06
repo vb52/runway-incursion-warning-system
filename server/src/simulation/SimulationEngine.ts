@@ -26,6 +26,16 @@ export interface DetectionResult {
   // When present, this becomes the event's actual DETECTION_IMAGE instead of
   // the generated placeholder (see MediaGeneratorService.saveDetectionSnapshot).
   snapshotBase64?: string;
+  // A real frame from N seconds BEFORE the detection, taken from the client's
+  // rolling pre-event buffer (ZoneConfig.tsx's preEventFramesRef). Becomes the
+  // event's PRE_EVENT_IMAGE instead of the drawn placeholder. Absent whenever
+  // the buffer couldn't offer a trustworthy frame — it is cleared on video
+  // seek/RESET, since a frame from elsewhere in the clip would misrepresent
+  // what the scene looked like before this incursion.
+  preSnapshotBase64?: string;
+  // When preSnapshotBase64 was actually grabbed (ISO). Recorded separately
+  // because it is deliberately EARLIER than the event's detected_at.
+  preSnapshotCapturedAt?: string;
   // Client-generated alertEventId (see aiDetectionStateStore.ts's
   // buildAlertEventId) — passed through to EventService.createEvent purely
   // for audit-trail traceability. See CreateEventInput.alertEventId.
@@ -38,6 +48,13 @@ export interface ScenarioResult {
   eventId?: string;
   eventCode?: string;
   actions?: string[];
+  // Whether this detection created a brand-new event or was absorbed into an
+  // existing open one (see EventService.createEvent's dedup). Surfaced to the
+  // caller because the client schedules a delayed 事後影像 capture and must
+  // only attach it to an event THIS detection actually opened — attaching it
+  // to a dedup hit would overwrite the post-event frame of an earlier
+  // aircraft's still-open incursion with a later, unrelated one.
+  isNew?: boolean;
 }
 
 class SimulationEngine {
@@ -148,6 +165,7 @@ class SimulationEngine {
         eventId: event.id,
         eventCode: event.event_code,
         actions,
+        isNew: false,
       };
     }
 
@@ -216,14 +234,41 @@ class SimulationEngine {
     // this is about not discarding real evidence, not about generating
     // placeholder art for routine authorized movements.
     const hasRealSnapshot = typeof detection.snapshotBase64 === 'string' && detection.snapshotBase64.length > 0;
+    // The client keeps a rolling one-frame-per-second buffer of the seconds
+    // BEFORE the trigger (see ZoneConfig.tsx's preEventFramesRef) and sends
+    // the oldest one along, so 事前影像 is the actual approach rather than a
+    // drawn "MONITORING / no target in frame" placeholder. Optional — the
+    // buffer is deliberately dropped on seek/RESET, since frames from a
+    // different part of the clip would be a misleading "before" picture.
+    const hasRealPreSnapshot = typeof detection.preSnapshotBase64 === 'string' && detection.preSnapshotBase64.length > 0;
     if (severity === 'RED' || severity === 'YELLOW' || hasRealSnapshot) {
       try {
-        const mediaRecords = mediaGeneratorService.generateEventMedia(event, { skipDetectionImage: hasRealSnapshot });
+        const mediaRecords = mediaGeneratorService.generateEventMedia(event, {
+          skipDetectionImage: hasRealSnapshot,
+          skipPreEventImage: hasRealPreSnapshot,
+        });
         if (hasRealSnapshot) {
           try {
-            mediaRecords.push(mediaGeneratorService.saveDetectionSnapshot(event, detection.snapshotBase64!));
+            mediaRecords.push(mediaGeneratorService.saveBinaryMedia(event, detection.snapshotBase64!, {
+              mediaType: 'DETECTION_IMAGE',
+              fileName: 'detection.jpg',
+            }));
           } catch (err) {
             logger.error('[SIM] Failed to save real detection snapshot, falling back to none:', err);
+          }
+        }
+        if (hasRealPreSnapshot) {
+          try {
+            mediaRecords.push(mediaGeneratorService.saveBinaryMedia(event, detection.preSnapshotBase64!, {
+              mediaType: 'PRE_EVENT_IMAGE',
+              fileName: 'pre-event.jpg',
+              // Stamped with when the frame was actually grabbed, not with
+              // event time — the whole point of 事前影像 is that it predates
+              // the detection, and the review UI shows this timestamp.
+              capturedAt: detection.preSnapshotCapturedAt,
+            }));
+          } catch (err) {
+            logger.error('[SIM] Failed to save real pre-event snapshot, falling back to placeholder:', err);
           }
         }
         mediaRecords.forEach((record) => {
@@ -235,7 +280,8 @@ class SimulationEngine {
             captured_at: record.capturedAt,
           });
         });
-        actions.push(`生成 ${mediaRecords.length} 個媒體檔案${hasRealSnapshot ? '（含真實偵測截圖）' : ''}`);
+        const realCount = (hasRealSnapshot ? 1 : 0) + (hasRealPreSnapshot ? 1 : 0);
+        actions.push(`生成 ${mediaRecords.length} 個媒體檔案${realCount > 0 ? `（含 ${realCount} 張真實影像）` : ''}`);
 
         eventService.addTimeline(event.id, {
           action_type: 'MEDIA_GENERATED',
@@ -270,6 +316,7 @@ class SimulationEngine {
       eventId: event.id,
       eventCode: event.event_code,
       actions,
+      isNew: true,
     };
   }
 

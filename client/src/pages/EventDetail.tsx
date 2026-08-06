@@ -596,13 +596,26 @@ export function EventDetail() {
                   {/* .svg = generated placeholder; .jpg/.jpeg/.png = a real
                       camera snapshot (see ZoneConfig.tsx's incursion-line
                       scanning / SimulationEngine.processDetection's
-                      snapshotBase64) — both render the same way. */}
+                      snapshotBase64) — both render the same way.
+                      .webm/.mp4 = the 事件影片 clip MediaRecorder produced at
+                      the moment of the incursion (see ZoneConfig.tsx's
+                      recordEventVideo); without its own branch it fell
+                      through to the filename placeholder below and was
+                      archived but unwatchable. */}
                   {/\.(svg|jpe?g|png)$/i.test(m.file_path) ? (
                     <img
                       src={`/api/media/events/${m.file_path}`}
                       alt={m.file_name}
                       className="w-full h-full object-contain"
                       loading="lazy"
+                    />
+                  ) : /\.(webm|mp4)$/i.test(m.file_path) ? (
+                    <video
+                      src={`/api/media/events/${m.file_path}`}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      className="w-full h-full object-contain"
                     />
                   ) : (
                     <div className="text-gray-700 text-xs font-mono">{m.file_name}</div>

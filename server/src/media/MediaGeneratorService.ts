@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { RiwsEvent, EventMedia, MediaType } from '../types';
+import { RiwsEvent, MediaType } from '../types';
 import { formatDisplay, nowIso, offsetMs } from '../utils/datetime';
 import { logger } from '../utils/logger';
 
@@ -208,13 +208,20 @@ export interface GeneratedMediaRecord {
 }
 
 class MediaGeneratorService {
-  // skipDetectionImage: true when a real camera snapshot is being attached
-  // instead (see saveDetectionSnapshot) — otherwise the event would end up
-  // with both a real detection.jpg AND a placeholder detection.svg both
-  // tagged DETECTION_IMAGE, showing two conflicting "detection" images.
-  // PRE/POST_EVENT_IMAGE are still generated either way — there's no real
-  // "before/after" frame to substitute those with.
-  generateEventMedia(event: RiwsEvent, options?: { skipDetectionImage?: boolean }): GeneratedMediaRecord[] {
+  // skipDetectionImage / skipPreEventImage: true when a real camera frame is
+  // being attached for that slot instead (see saveBinaryMedia) — otherwise
+  // the event would end up with both a real .jpg AND a placeholder .svg both
+  // tagged the same media_type, showing two conflicting images for one
+  // moment.
+  //
+  // POST_EVENT_IMAGE has no skip flag on purpose: it can only be captured
+  // some seconds AFTER this runs (the "after" frame does not exist yet at
+  // event-creation time — see the attach-media route), so the placeholder is
+  // always written first and replaced later if a real one arrives.
+  generateEventMedia(
+    event: RiwsEvent,
+    options?: { skipDetectionImage?: boolean; skipPreEventImage?: boolean },
+  ): GeneratedMediaRecord[] {
     const storageBase = getAbsoluteStorageBase();
     const eventDir = path.join(storageBase, event.event_code);
     ensureDir(eventDir);
@@ -229,29 +236,31 @@ class MediaGeneratorService {
 
     // PRE-EVENT: Normal state, no target in frame
     const preTime = new Date(now - 30000).toISOString();
-    const preSvg = generateSvgContent({
-      title: 'PRE-EVENT IMAGE',
-      cameraId,
-      datetime: formatDisplay(preTime),
-      taxiwayId,
-      targetId,
-      targetType,
-      confidence: 0,
-      showBoundingBox: false,
-      incursionStatus: 'MONITORING',
-      isIncursion: false,
-      frameColor: '#006600',
-      frameLabel: '▶ PRE-EVENT | NORMAL',
-    });
-    const preFileName = 'pre-event.svg';
-    const preFilePath = path.join(eventDir, preFileName);
-    fs.writeFileSync(preFilePath, preSvg, 'utf-8');
-    records.push({
-      mediaType: 'PRE_EVENT_IMAGE',
-      fileName: preFileName,
-      filePath: `${event.event_code}/${preFileName}`,
-      capturedAt: preTime,
-    });
+    if (!options?.skipPreEventImage) {
+      const preSvg = generateSvgContent({
+        title: 'PRE-EVENT IMAGE',
+        cameraId,
+        datetime: formatDisplay(preTime),
+        taxiwayId,
+        targetId,
+        targetType,
+        confidence: 0,
+        showBoundingBox: false,
+        incursionStatus: 'MONITORING',
+        isIncursion: false,
+        frameColor: '#006600',
+        frameLabel: '▶ PRE-EVENT | NORMAL',
+      });
+      const preFileName = 'pre-event.svg';
+      const preFilePath = path.join(eventDir, preFileName);
+      fs.writeFileSync(preFilePath, preSvg, 'utf-8');
+      records.push({
+        mediaType: 'PRE_EVENT_IMAGE',
+        fileName: preFileName,
+        filePath: `${event.event_code}/${preFileName}`,
+        capturedAt: preTime,
+      });
+    }
 
     // DETECTION: Target detected with bounding box (skipped when a real
     // camera snapshot is being attached instead — see saveDetectionSnapshot)
@@ -313,31 +322,43 @@ class MediaGeneratorService {
     return records;
   }
 
-  // Writes a REAL camera frame (base64-encoded JPEG, captured client-side
-  // from the detector's <video> when crossing config.incursion_line — see
-  // DetectorConfig.tsx) to disk as this event's detection image, instead of
-  // the generated placeholder. Paired with generateEventMedia's
-  // skipDetectionImage option so the two never both claim DETECTION_IMAGE.
-  saveDetectionSnapshot(event: RiwsEvent, base64Jpeg: string): GeneratedMediaRecord {
+  // Writes REAL captured media (base64, from the detector's <video> — see
+  // ZoneConfig.tsx's captureSnapshot / event-video recorder) to disk under
+  // the event's directory, replacing the corresponding generated placeholder.
+  // Paired with generateEventMedia's skip* options so a real file and a
+  // placeholder never both claim the same media_type.
+  //
+  // Overwrites by fixed file name per slot rather than accumulating
+  // timestamped files: an event has exactly one 事前/偵測/事後 frame and one
+  // clip, and a late-arriving real frame is meant to REPLACE the placeholder
+  // (the caller drops the old media row to match — see the attach route).
+  // Naming them by slot is what makes that replacement possible at all.
+  saveBinaryMedia(
+    event: RiwsEvent,
+    base64: string,
+    opts: { mediaType: MediaType; fileName: string; capturedAt?: string },
+  ): GeneratedMediaRecord {
     const storageBase = getAbsoluteStorageBase();
     const eventDir = path.join(storageBase, event.event_code);
     ensureDir(eventDir);
 
-    // Tolerate both a raw base64 string and a "data:image/jpeg;base64,...." URI.
-    const commaIdx = base64Jpeg.indexOf(',');
-    const raw = base64Jpeg.startsWith('data:') && commaIdx !== -1 ? base64Jpeg.slice(commaIdx + 1) : base64Jpeg;
+    // Tolerate both a raw base64 string and a "data:<mime>;base64,...." URI.
+    const commaIdx = base64.indexOf(',');
+    const raw = base64.startsWith('data:') && commaIdx !== -1 ? base64.slice(commaIdx + 1) : base64;
     const buffer = Buffer.from(raw, 'base64');
+    if (buffer.length === 0) {
+      throw new Error('Decoded media is empty — base64 payload was not valid.');
+    }
 
-    const fileName = 'detection.jpg';
-    const filePath = path.join(eventDir, fileName);
+    const filePath = path.join(eventDir, opts.fileName);
     fs.writeFileSync(filePath, buffer);
-    logger.info(`[MEDIA] Saved real detection snapshot for event ${event.event_code} (${buffer.length} bytes)`);
+    logger.info(`[MEDIA] Saved real ${opts.mediaType} for event ${event.event_code} → ${opts.fileName} (${buffer.length} bytes)`);
 
     return {
-      mediaType: 'DETECTION_IMAGE',
-      fileName,
-      filePath: `${event.event_code}/${fileName}`,
-      capturedAt: event.detected_at,
+      mediaType: opts.mediaType,
+      fileName: opts.fileName,
+      filePath: `${event.event_code}/${opts.fileName}`,
+      capturedAt: opts.capturedAt ?? event.detected_at,
     };
   }
 

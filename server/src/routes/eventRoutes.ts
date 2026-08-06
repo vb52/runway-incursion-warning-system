@@ -2,7 +2,9 @@ import { Router, Request, Response } from 'express';
 import { eventService } from '../services/EventService';
 import { auditService } from '../services/AuditService';
 import { simulationEngine } from '../simulation/SimulationEngine';
-import { EventFilters, EventSeverity, EventStatus, TargetType, EventType } from '../types';
+import { mediaGeneratorService } from '../media/MediaGeneratorService';
+import { logger } from '../utils/logger';
+import { EventFilters, EventSeverity, EventStatus, TargetType, EventType, MediaType } from '../types';
 
 const router = Router();
 
@@ -150,6 +152,77 @@ router.post('/:id/timeline', (req: Request, res: Response) => {
   });
 
   res.status(201).json({ success: true, data: entry });
+});
+
+// POST /api/events/:id/media
+// Attaches media that can only exist AFTER the event was created — the
+// delayed 事後影像 frame and the 事件影片 clip, both captured client-side and
+// uploaded once the recording window has actually elapsed (see
+// ZoneConfig.tsx's schedulePostEventCapture / event-video recorder).
+//
+// Restricted to those two slots on purpose. PRE/DETECTION images arrive with
+// the detection itself (POST /api/demo/detect) where they are bound to the
+// same authorization decision that classified the event; letting a later,
+// unauthenticated call overwrite the frame the incursion was JUDGED on would
+// make the primary evidence mutable after the fact.
+const ATTACHABLE_MEDIA_TYPES: MediaType[] = ['POST_EVENT_IMAGE', 'EVENT_VIDEO'];
+const MEDIA_FILE_NAMES: Record<string, string> = {
+  POST_EVENT_IMAGE: 'post-event.jpg',
+  EVENT_VIDEO: 'event-video.webm',
+};
+
+router.post('/:id/media', (req: Request, res: Response) => {
+  const event = eventService.getEventById(req.params.id);
+  if (!event) {
+    return res.status(404).json({ success: false, error: 'Event not found.' });
+  }
+
+  const mediaType = req.body?.media_type as MediaType;
+  if (!ATTACHABLE_MEDIA_TYPES.includes(mediaType)) {
+    return res.status(400).json({
+      success: false,
+      error: `media_type must be one of ${ATTACHABLE_MEDIA_TYPES.join(', ')}.`,
+    });
+  }
+
+  const base64 = req.body?.base64;
+  if (typeof base64 !== 'string' || base64.length === 0) {
+    return res.status(400).json({ success: false, error: 'base64 is required.' });
+  }
+
+  try {
+    const record = mediaGeneratorService.saveBinaryMedia(event, base64, {
+      mediaType,
+      fileName: MEDIA_FILE_NAMES[mediaType],
+      capturedAt: typeof req.body?.captured_at === 'string' ? req.body.captured_at : undefined,
+    });
+
+    // Replace, don't accumulate — the generated placeholder for this slot (or
+    // an earlier upload of the same slot) must not survive alongside the real
+    // file. See EventService.removeMediaOfType.
+    const replaced = eventService.removeMediaOfType(event.id, mediaType);
+    const media = eventService.addMedia(event.id, {
+      media_type: record.mediaType,
+      file_name: record.fileName,
+      file_path: record.filePath,
+      camera_id: typeof req.body?.camera_id === 'string' ? req.body.camera_id : event.camera_id,
+      captured_at: record.capturedAt,
+    });
+
+    eventService.addTimeline(event.id, {
+      action_type: mediaType === 'EVENT_VIDEO' ? 'EVENT_VIDEO_RECORDED' : 'POST_EVENT_CAPTURED',
+      description: mediaType === 'EVENT_VIDEO'
+        ? '事件影片錄製完成並歸檔'
+        : '事後影像已擷取並歸檔',
+      source_type: 'SYSTEM',
+      metadata: { media_type: mediaType, file_name: record.fileName, replaced_placeholder: replaced > 0 },
+    });
+
+    res.status(201).json({ success: true, data: media });
+  } catch (err) {
+    logger.error('[EVENT] Failed to attach media:', err);
+    res.status(400).json({ success: false, error: err instanceof Error ? err.message : 'Failed to attach media.' });
+  }
 });
 
 // GET /api/events/:id/media

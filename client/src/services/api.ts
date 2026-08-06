@@ -127,6 +127,20 @@ export const eventsApi = {
       body: JSON.stringify(entry),
     }),
   getMedia: (id: string) => apiCall(`/events/${id}/media`),
+  // Attaches media that can only be captured AFTER the event exists — the
+  // delayed 事後影像 frame and the 事件影片 clip. Server restricts media_type
+  // to those two slots (see eventRoutes) so a late call can never overwrite
+  // the frame the incursion was actually judged on.
+  attachMedia: (id: string, payload: {
+    media_type: 'POST_EVENT_IMAGE' | 'EVENT_VIDEO';
+    base64: string;
+    camera_id?: string;
+    captured_at?: string;
+  }) =>
+    apiCall(`/events/${id}/media`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 };
 
 // ── VLM API ────────────────────────────────────────────────────────────────
@@ -175,6 +189,15 @@ export const demoApi = {
     // detection — see ZoneConfig.tsx's incursion-line scanning. Becomes
     // the event's real DETECTION_IMAGE instead of the generated placeholder.
     snapshot_base64?: string;
+    // A real frame from a few seconds BEFORE the detection, out of
+    // ZoneConfig.tsx's rolling pre-event buffer — becomes the event's
+    // PRE_EVENT_IMAGE instead of the drawn placeholder. Absent when the
+    // buffer had nothing trustworthy to offer (it is cleared on video
+    // seek/RESET).
+    pre_snapshot_base64?: string;
+    // When that frame was grabbed (ISO) — deliberately earlier than the
+    // event's own detected_at, which is why it travels separately.
+    pre_snapshot_captured_at?: string;
     // The client-generated alertEventId (see aiDetectionStateStore's
     // buildAlertEventId) that triggered this call — carried through purely
     // for backend audit traceability (see demoRoutes.ts). The client
@@ -182,7 +205,11 @@ export const demoApi = {
     // needs to echo it back for that to work.
     alert_event_id?: string;
   }) =>
-    apiCall<{ success: boolean; message?: string; data?: { eventId?: string; eventCode?: string; actions?: string[] } }>('/demo/detect', {
+    // isNew distinguishes a freshly-opened event from a dedup hit on an
+    // existing open one — the client only schedules 事後影像/事件影片 capture
+    // for the former, so a later aircraft can't overwrite an earlier one's
+    // aftermath. See SimulationEngine's ScenarioResult.
+    apiCall<{ success: boolean; message?: string; data?: { eventId?: string; eventCode?: string; actions?: string[]; isNew?: boolean } }>('/demo/detect', {
       method: 'POST',
       body: JSON.stringify(params),
     }),

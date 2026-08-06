@@ -34,6 +34,10 @@ router.get('/events/:eventCode/:filename', (req: Request, res: Response) => {
     '.jpg': 'image/jpeg',
     '.jpeg': 'image/jpeg',
     '.mp4': 'video/mp4',
+    // What MediaRecorder actually produces in Chrome/Edge for the 事件影片
+    // clip (see ZoneConfig.tsx's recorder) — served as-is rather than
+    // transcoded, so archiving stays dependency-free.
+    '.webm': 'video/webm',
   };
 
   const contentType = contentTypes[ext] ?? 'application/octet-stream';

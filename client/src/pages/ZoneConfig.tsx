@@ -69,7 +69,7 @@ import {
 } from 'lucide-react';
 import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
-import { detectorApi, demoApi } from '../services/api';
+import { detectorApi, demoApi, eventsApi } from '../services/api';
 import { DetectorConfig, DetectorMotionZone, DetectorRect, ALL_TAXIWAY_IDS, TaxiwayId } from '../types';
 import { useVideoSync, getLastProgrammaticSeekAt } from '../hooks/useVideoSync';
 import { useDetectorAlert } from '../hooks/useDetectorAlert';
@@ -161,6 +161,22 @@ const TRIGGER_TOLERANCE_S = 0.35;
 // TensorFlow AI object-detection loop, which never touches the event/
 // animation state machine).
 const AI_DETECTION_INTERVAL_MS = 1000;
+
+// ── 事件自動記錄 ──────────────────────────────────────────────────────────
+// How many 1 Hz frames of "before" to keep (see preEventFramesRef) — 6s back
+// is enough to show an aircraft approaching the line without holding a large
+// pile of JPEGs in memory.
+const PRE_EVENT_BUFFER_SIZE = 6;
+// How long after the trigger to grab the 事後影像 frame. Long enough that the
+// aircraft has visibly moved on (or visibly hasn't — equally informative),
+// short enough that the operator sees it while still reviewing the alert.
+const POST_EVENT_CAPTURE_DELAY_MS = 6000;
+// Length of the 事件影片 clip recorded from the trigger onward.
+const EVENT_VIDEO_DURATION_MS = 8000;
+// Modest bitrate: the clip is evidence of what happened, not broadcast
+// material, and it travels to the server base64-encoded inside a JSON body
+// (~33% overhead) against express.json's 10mb limit.
+const EVENT_VIDEO_BITS_PER_SECOND = 1_200_000;
 
 function formatTime(s: number): string {
   if (!isFinite(s) || s < 0) return '0:00';
@@ -739,6 +755,153 @@ export function ZoneConfigPage() {
     // function can't see on its own.
   }, [armRunwayAlert]);
 
+  // Grabs the CURRENT full video frame as a JPEG for a 跑道入侵線 hit — real
+  // evidence attached to the resulting event instead of the generated
+  // placeholder. Capped at 960px wide (not the native frame) to keep the
+  // JSON payload a reasonable size.
+  const snapshotCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const captureSnapshot = useCallback((video: HTMLVideoElement): string | undefined => {
+    if (!video.videoWidth) return undefined;
+    if (!snapshotCanvasRef.current) snapshotCanvasRef.current = document.createElement('canvas');
+    const canvas = snapshotCanvasRef.current;
+    const scale = Math.min(1, 960 / video.videoWidth);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    try {
+      return canvas.toDataURL('image/jpeg', 0.85);
+    } catch {
+      return undefined; // e.g. tainted canvas — fail quiet, event still gets created without a snapshot
+    }
+  }, []);
+
+  // ── 事前影像環形緩衝 ──────────────────────────────────────────────────────
+  // One frame per AI 判讀 pass (1 Hz), keeping the last PRE_EVENT_BUFFER_SIZE
+  // seconds. When the incursion line fires, the OLDEST retained frame is sent
+  // as the event's 事前影像 — the approach, a few seconds before the aircraft
+  // reached the line, instead of the drawn "MONITORING / no target in frame"
+  // placeholder that stood in for it.
+  //
+  // Buffered rather than captured on demand for the obvious reason: by the
+  // time a trigger happens, the "before" moment has already gone. Cheap
+  // enough to run unconditionally — one 960px JPEG encode per second, next to
+  // the frame-diff sampling this same tick already does.
+  const preEventFramesRef = useRef<{ dataUrl: string; capturedAt: string }[]>([]);
+  const pushPreEventFrame = useCallback((video: HTMLVideoElement) => {
+    const dataUrl = captureSnapshot(video);
+    if (!dataUrl) return;
+    const buf = preEventFramesRef.current;
+    buf.push({ dataUrl, capturedAt: new Date().toISOString() });
+    while (buf.length > PRE_EVENT_BUFFER_SIZE) buf.shift();
+  }, [captureSnapshot]);
+
+  // Oldest retained frame — the furthest back this buffer can honestly reach.
+  // Returns undefined when the buffer holds only the triggering moment
+  // itself: a "before" picture taken at the same instant as the detection
+  // isn't a before picture, and the server would rather keep its placeholder
+  // than label a simultaneous frame as 事前影像.
+  const takePreEventFrame = useCallback((): { dataUrl: string; capturedAt: string } | undefined => {
+    const buf = preEventFramesRef.current;
+    return buf.length >= 2 ? buf[0] : undefined;
+  }, []);
+
+  // ── 事後影像 ──────────────────────────────────────────────────────────────
+  // Grabs a frame POST_EVENT_CAPTURE_DELAY_MS after the trigger and attaches
+  // it to the server's event, replacing that event's generated placeholder.
+  //
+  // Guarded by the generation id: a RESET or video seek during the wait means
+  // the clip is no longer showing the aftermath of this incursion, and a
+  // frame from somewhere else entirely is worse than the honest placeholder.
+  // Failures stay silent for the same reason every other capture path here
+  // does — 自動記錄 is supplementary evidence and must never surface as an
+  // error competing for the operator's attention during a live alarm.
+  const schedulePostEventCapture = useCallback((serverEventId: string) => {
+    const generationAtSchedule = getCurrentGenerationId();
+    window.setTimeout(() => {
+      if (getCurrentGenerationId() !== generationAtSchedule) return;
+      const video = videoRef.current;
+      if (!video) return;
+      const dataUrl = captureSnapshot(video);
+      if (!dataUrl) return;
+      eventsApi.attachMedia(serverEventId, {
+        media_type: 'POST_EVENT_IMAGE',
+        base64: dataUrl,
+        camera_id: 'DETECTOR-INCURSION-LINE',
+        captured_at: new Date().toISOString(),
+      }).catch(() => { /* supplementary evidence — never interrupt the alarm */ });
+    }, POST_EVENT_CAPTURE_DELAY_MS);
+  }, [captureSnapshot]);
+
+  // ── 事件影片 ──────────────────────────────────────────────────────────────
+  // Records EVENT_VIDEO_DURATION_MS of the live feed from the trigger onward
+  // via MediaRecorder over the <video>'s own captureStream.
+  //
+  // Recording starts AT the trigger, with no pre-roll, and that is a
+  // deliberate limit rather than an oversight: this page's clip loops and the
+  // operator can seek it, so a continuously-running recorder would splice
+  // unrelated footage across a wrap and hand the reviewer a clip that never
+  // happened. 事前影像 covers the approach instead — a still frame that is
+  // definitely real beats a video that might not be. For the same reason the
+  // whole recording is DISCARDED if a seek/RESET lands mid-capture.
+  const eventVideoRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordEventVideo = useCallback((serverEventId: string) => {
+    // One recording at a time — a second incursion while this one is still
+    // capturing keeps the first clip rather than truncating it into a stub.
+    if (eventVideoRecorderRef.current) return;
+    const video = videoRef.current as (HTMLVideoElement & { captureStream?: () => MediaStream }) | null;
+    if (!video?.captureStream) return; // Safari/older browsers — 事前/偵測/事後 stills still work
+    let stream: MediaStream;
+    try {
+      stream = video.captureStream();
+    } catch {
+      return;
+    }
+    if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported('video/webm')) return;
+
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream, { mimeType: 'video/webm', videoBitsPerSecond: EVENT_VIDEO_BITS_PER_SECOND });
+    } catch {
+      return;
+    }
+    eventVideoRecorderRef.current = recorder;
+
+    const generationAtStart = getCurrentGenerationId();
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = () => {
+      eventVideoRecorderRef.current = null;
+      // Seek/RESET during the window — the footage no longer belongs to this
+      // event. Drop it rather than archiving a misleading clip.
+      if (getCurrentGenerationId() !== generationAtStart) return;
+      if (chunks.length === 0) return;
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        if (typeof reader.result !== 'string') return;
+        eventsApi.attachMedia(serverEventId, {
+          media_type: 'EVENT_VIDEO',
+          base64: reader.result,
+          camera_id: 'DETECTOR-INCURSION-LINE',
+          captured_at: new Date().toISOString(),
+        }).catch(() => { /* supplementary evidence — stay quiet */ });
+      };
+      reader.readAsDataURL(blob);
+    };
+
+    try {
+      recorder.start();
+    } catch {
+      eventVideoRecorderRef.current = null;
+      return;
+    }
+    window.setTimeout(() => {
+      if (recorder.state !== 'inactive') recorder.stop();
+    }, EVENT_VIDEO_DURATION_MS);
+  }, []);
+
   // Date.now() ms of the last incursion-line trigger — deliberately
   // separate from lastTriggerAtRef/TRIGGER_COOLDOWN_MS (see
   // INCURSION_LINE_TRIGGER_COOLDOWN_MS's comment). Only ever reset by
@@ -791,6 +954,7 @@ export function ZoneConfigPage() {
   const reportIncursionLineTrigger = useCallback(async (
     confidence: number, taxiwayId: string, snapshotBase64: string | undefined, alertEventId: string,
     aircraftEventId: string | null, targetId: string,
+    preEventFrame: { dataUrl: string; capturedAt: string } | undefined,
   ) => {
     // The Gate, re-checked HERE (not just trusted from the caller) — every
     // entry point that can create/write a real alert must pass it itself,
@@ -828,6 +992,8 @@ export function ZoneConfigPage() {
       entering_runway: true,
       camera_id: 'DETECTOR-INCURSION-LINE',
       snapshot_base64: snapshotBase64,
+      pre_snapshot_base64: preEventFrame?.dataUrl,
+      pre_snapshot_captured_at: preEventFrame?.capturedAt,
       alert_event_id: alertEventId,
     }).then((res) => {
       // Correlate the server's own event id back to OUR alertEventId so
@@ -836,10 +1002,19 @@ export function ZoneConfigPage() {
       // see recordServerEventCorrelation's comment.
       const serverEventId = res.data?.eventId;
       if (serverEventId) recordServerEventCorrelation(serverEventId, alertEventId);
+
+      // 事後影像 + 事件影片 — only for an event THIS detection actually
+      // opened. On a dedup hit the server hands back an earlier aircraft's
+      // still-open event, and attaching to that would overwrite its
+      // aftermath with a later, unrelated aircraft's. See ScenarioResult.
+      if (serverEventId && res.data?.isNew) {
+        schedulePostEventCapture(serverEventId);
+        recordEventVideo(serverEventId);
+      }
     }).catch(() => {
       // Can still fail (e.g. RWY enable itself failed) — stay quiet.
     });
-  }, [armRunwayAlert, canIssueIncursionAlertNow]);
+  }, [armRunwayAlert, canIssueIncursionAlertNow, schedulePostEventCapture, recordEventVideo]);
 
   // ── 1. AI object detection (TensorFlow.js + COCO-SSD) ───────────────────
   useEffect(() => {
@@ -1021,6 +1196,10 @@ export function ZoneConfigPage() {
     prevZoneHitsRef.current = new Map();        // 舊的 Z1/Z2/Z3 rising-edge 追蹤
     lastTriggerAtRef.current = new Map();       // 舊的事件 Cooldown
     lastIncursionTriggerAtRef.current = 0;      // 舊的入侵線 Cooldown
+    // 事前影像緩衝 — frames from before a seek/RESET show a different part of
+    // the clip entirely, so they can never serve as "what it looked like
+    // before" for anything detected after this point. See preEventFramesRef.
+    preEventFramesRef.current = [];
     incursionAlarmedEventsRef.current = new Map(); // 舊的「這架已經叫過了」記錄
     aiSnapshotSequenceRef.current = new Map();  // 舊的 AiDetectionSnapshot sequence
     aiSnapshotEventIdRef.current = new Map();   // 舊的 AiDetectionSnapshot eventId 對應
@@ -1155,28 +1334,6 @@ export function ZoneConfigPage() {
     }
     prevFramesRef.current.set(zone.id, new Uint8ClampedArray(frame));
     return changed / totalPixels;
-  }, []);
-
-  // Grabs the CURRENT full video frame as a JPEG for a 跑道入侵線 hit — real
-  // evidence attached to the resulting event instead of the generated
-  // placeholder. Capped at 960px wide (not the native frame) to keep the
-  // JSON payload a reasonable size.
-  const snapshotCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const captureSnapshot = useCallback((video: HTMLVideoElement): string | undefined => {
-    if (!video.videoWidth) return undefined;
-    if (!snapshotCanvasRef.current) snapshotCanvasRef.current = document.createElement('canvas');
-    const canvas = snapshotCanvasRef.current;
-    const scale = Math.min(1, 960 / video.videoWidth);
-    canvas.width = Math.round(video.videoWidth * scale);
-    canvas.height = Math.round(video.videoHeight * scale);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return undefined;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    try {
-      return canvas.toDataURL('image/jpeg', 0.85);
-    } catch {
-      return undefined; // e.g. tainted canvas — fail quiet, event still gets created without a snapshot
-    }
   }, []);
 
   // Every emit carries the event's own id (see eventIdCounter) so
@@ -1542,6 +1699,10 @@ export function ZoneConfigPage() {
 
       analysisInProgressRef.current = true;
       const requestId = ++analysisRequestIdRef.current;
+      // Roll the 事前影像 buffer forward on every pass, before any judgment is
+      // made — the "before" frame has to already be in hand by the time a
+      // trigger is decided (see preEventFramesRef).
+      pushPreEventFrame(video);
       try {
         // Computed ONCE per pass so every taxiway/zone this tick sees the
         // exact same Gate reading — see computeCanIssueIncursionAlert's
@@ -1684,6 +1845,7 @@ export function ZoneConfigPage() {
               incursionLineConfidence, taxiwayId, incursionLineSnapshotBase64, published.eventId,
               furthestAlongEvent(events)?.id ?? null,
               buildDetectionTargetId(aircraftEventId ?? `unlinked-${taxiwayId}-${snapshot.analysisTimestamp}`),
+              takePreEventFrame(),
             );
           }
 
@@ -1759,7 +1921,7 @@ export function ZoneConfigPage() {
       } finally {
         analysisInProgressRef.current = false;
       }
-  }, [computeZoneScore, captureSnapshot, reportIncursionLineTrigger, armRunwayAlert, processAircraftEventSnapshot, publishAiDetectionSnapshot, getAlertGateState]);
+  }, [computeZoneScore, captureSnapshot, pushPreEventFrame, takePreEventFrame, reportIncursionLineTrigger, armRunwayAlert, processAircraftEventSnapshot, publishAiDetectionSnapshot, getAlertGateState]);
 
   useEffect(() => {
     if (!motionEnabled) {

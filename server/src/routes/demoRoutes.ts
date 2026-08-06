@@ -91,6 +91,10 @@ router.post('/detect', async (req: Request, res: Response) => {
   // DetectorConfig.tsx) — optional, JSON body so no multipart/upload
   // handling needed. Anything else keeps working exactly as before.
   const snapshotBase64 = typeof body.snapshot_base64 === 'string' ? body.snapshot_base64 : undefined;
+  // Real frame from BEFORE the trigger, out of the client's rolling
+  // pre-event buffer — see DetectionResult.preSnapshotBase64.
+  const preSnapshotBase64 = typeof body.pre_snapshot_base64 === 'string' ? body.pre_snapshot_base64 : undefined;
+  const preSnapshotCapturedAt = typeof body.pre_snapshot_captured_at === 'string' ? body.pre_snapshot_captured_at : undefined;
   // Client-generated alertEventId (see aiDetectionStateStore.ts's
   // buildAlertEventId) — optional, purely for audit-trail traceability. See
   // SimulationEngine.DetectionResult.alertEventId / EventService.
@@ -109,6 +113,8 @@ router.post('/detect', async (req: Request, res: Response) => {
     confidence,
     enteringRunway,
     snapshotBase64,
+    preSnapshotBase64,
+    preSnapshotCapturedAt,
     alertEventId,
   });
 
@@ -123,6 +129,7 @@ router.post('/detect', async (req: Request, res: Response) => {
       eventId: result.eventId,
       eventCode: result.eventCode,
       actions: result.actions,
+      isNew: result.isNew,
     },
   });
 });

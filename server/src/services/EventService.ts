@@ -348,6 +348,22 @@ class EventService {
     return db.prepare('SELECT * FROM event_media WHERE id = ?').get(mediaId) as EventMedia | undefined;
   }
 
+  // Drops every media row of one type for an event. Used when a real captured
+  // file arrives for a slot that already holds a generated placeholder (see
+  // the attach-media route) — without this the event would list two
+  // PRE/POST_EVENT_IMAGEs and the review UI would show the placeholder and
+  // the real frame side by side as if both were evidence.
+  //
+  // Only the DB rows go; the placeholder file itself is left on disk. It is
+  // small, it is inside the event's own directory (removed wholesale by
+  // deleteEventMedia), and deleting files here would make this operation
+  // non-idempotent for no benefit.
+  removeMediaOfType(eventId: string, mediaType: MediaType): number {
+    const db = getDb();
+    const result = db.prepare('DELETE FROM event_media WHERE event_id = ? AND media_type = ?').run(eventId, mediaType);
+    return Number(result.changes ?? 0);
+  }
+
   // ── Queries ────────────────────────────────────────────────────────────────
 
   getEventById(id: string): RiwsEvent | undefined {
