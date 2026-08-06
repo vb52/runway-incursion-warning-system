@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { systemStateService } from '../services/SystemStateService';
 import { auditService } from '../services/AuditService';
 import { detectorAlertService } from '../services/DetectorAlertService';
+import { eventService } from '../services/EventService';
 import { TaxiwayId, ALL_TAXIWAY_IDS } from '../types';
 
 const router = Router();
@@ -123,6 +124,28 @@ router.post('/:id/reset', (req: Request, res: Response) => {
     source_ip: req.ip,
     metadata: result.error ? { error: result.error } : undefined,
   });
+
+  // Record the 復歸 on the timeline of every incursion event it resolves.
+  // Until now this existed only in audit_logs, so an event's own detail page
+  // ended at "聯絡道已鎖定" and never showed that a human had since dealt with
+  // it — the operator's single most important action on the incident was
+  // invisible exactly where an incident review looks for it.
+  //
+  // Written only when the reset actually cleared a latch (result.success, and
+  // not the alreadyCleared no-op which returned earlier): a 復歸 on a taxiway
+  // that wasn't latched resolved nothing and must not appear on any event's
+  // history as though it had.
+  if (result.success) {
+    for (const event of eventService.getOpenIncursionEvents(id)) {
+      eventService.addTimeline(event.id, {
+        action_type: 'TAXIWAY_RESET',
+        description: `操作員 ${operatorName} 執行人工復歸，聯絡道 ${id} 解除鎖定`,
+        source_type: 'OPERATOR',
+        operator_name: operatorName,
+        metadata: { taxiway: id, previous_state: previousState, new_state: 'GUARDED' },
+      });
+    }
+  }
 
   if (!result.success) {
     return res.status(400).json({ success: false, error: result.error });

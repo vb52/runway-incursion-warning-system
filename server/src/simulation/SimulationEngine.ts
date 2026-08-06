@@ -165,6 +165,37 @@ class SimulationEngine {
         new_state: 'INCURSION_LATCHED',
         metadata: { eventId: event.id, targetId: detection.targetId },
       });
+
+      // ...and onto the EVENT's own timeline, not just the global audit log.
+      // The two answer different questions: audit_logs is "what did the system
+      // do, across everything", the event timeline is "what happened to THIS
+      // incursion". An operator reviewing one incident reads the latter, and
+      // the latch — the single most consequential automatic action taken —
+      // was missing from it entirely.
+      eventService.addTimeline(event.id, {
+        action_type: 'INCURSION_LATCHED',
+        description: `聯絡道 ${detection.taxiwayId} 已自動鎖定為 INCURSION_LATCHED 狀態，須人工復歸`,
+        source_type: 'SYSTEM',
+        occurred_at: nowIso(),
+        metadata: { taxiway: detection.taxiwayId, previous_state: taxiwayState },
+      });
+
+      // The alarm going out is itself part of the record: it is what turns a
+      // detection into something a human was actually told about. Client count
+      // comes from Socket.IO rather than being assumed — an incursion
+      // broadcast to ZERO connected clients is exactly the kind of thing an
+      // incident review needs to be able to see, and it would otherwise leave
+      // no trace anywhere.
+      const clientCount = this.io?.engine?.clientsCount ?? 0;
+      eventService.addTimeline(event.id, {
+        action_type: 'ALERT_BROADCAST',
+        description: clientCount > 0
+          ? `跑道入侵警報已廣播至 ${clientCount} 個連線端`
+          : '跑道入侵警報已發出，但當時沒有任何連線端可接收',
+        source_type: 'SYSTEM',
+        occurred_at: nowIso(),
+        metadata: { clientCount, severity, alertEventId: detection.alertEventId },
+      });
     }
 
     // Generate media for RED and YELLOW events — and for ANY event that

@@ -360,6 +360,25 @@ class EventService {
     return db.prepare('SELECT * FROM events WHERE event_code = ?').get(code) as RiwsEvent | undefined;
   }
 
+  // Every still-open RUNWAY_INCURSION on a taxiway, newest first — the events
+  // a 復歸 on that taxiway is resolving.
+  //
+  // Returns a LIST, not one event, and that is the point: since detections
+  // carry a real per-aircraft target_id, two aircraft can each hold their own
+  // open incursion event on the same taxiway (see createEvent's dedup and
+  // SimulationEngine's INCURSION_LATCHED comment). A 復歸 clears the taxiway's
+  // single latch, which is what ALL of them contributed to — so the operator's
+  // action belongs on each of their timelines, not only the most recent one.
+  // Picking just one would leave the others reading as never resolved.
+  getOpenIncursionEvents(taxiwayId: string): RiwsEvent[] {
+    const db = getDb();
+    return db.prepare(`
+      SELECT * FROM events
+      WHERE taxiway_id = ? AND event_type = 'RUNWAY_INCURSION' AND status != 'CLOSED'
+      ORDER BY detected_at DESC
+    `).all(taxiwayId) as unknown as RiwsEvent[];
+  }
+
   getEvents(filters: EventFilters = {}): PaginatedResult<RiwsEvent> {
     const db = getDb();
     const page = filters.page ?? 1;
